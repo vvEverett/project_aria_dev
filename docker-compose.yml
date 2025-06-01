@@ -1,0 +1,29 @@
+version: '3.3'
+
+services:
+  aria-dev:
+    build: .
+    container_name: aria-development
+    # Hardware access permissions
+    privileged: true
+    network_mode: host
+    ipc: host
+    volumes:
+      # Project workspace
+      - ./aria_workspace:/home/developer/aria_workspace
+      # IPC socket directory
+      - /tmp:/tmp
+      # Hardware access
+      - /dev/bus/usb:/dev/bus/usb
+      # Persistent data
+      - aria_venv:/home/developer/venv
+      - aria_config:/home/developer/.projectaria
+    environment:
+      - DISPLAY=${DISPLAY}
+    stdin_open: true
+    tty: true
+    working_dir: /home/developer/aria_workspace
+
+volumes:
+  aria_venv:
+  aria_config:

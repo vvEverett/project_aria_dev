@@ -1,4 +1,4 @@
-# UDP Receiver for Aria SLAM - Rotates images on receiver side
+# UDP Receiver for Aria SLAM - Receives and decompresses images
 
 import socket
 import struct
@@ -9,7 +9,7 @@ import threading
 from queue import LifoQueue, Empty
 
 # ======================= Configuration =======================
-LISTEN_IP = "0.0.0.0"
+LISTEN_IP = "127.0.0.1"
 LISTEN_PORT = 9999
 BUFFER_SIZE = 65536
 ROTATION_K = -1  # np.rot90 k parameter: -1=counterclockwise 90°, 1=clockwise 90°
@@ -23,7 +23,10 @@ class FrameReassembler:
 
     def process_packet(self, packet: bytes):
         magic_number = packet[:4]
-        if magic_number == b'SNGL':
+        if magic_number == b'COMP':
+            # Compressed single packet
+            return packet[4:]
+        elif magic_number == b'SNGL':
             return packet[4:]
         elif magic_number == b'FRAG':
             try:
@@ -58,8 +61,49 @@ class FrameReassembler:
         return None
 
 def parse_frame_payload(payload: bytes):
-    """Parse binary payload to reconstruct frame and metadata."""
+    """Parse binary payload to reconstruct frame and metadata (supports both compressed and uncompressed)."""
     try:
+        # Try compressed format first: timestamp, cam_id, orig_height, orig_width, orig_channels, compressed_size
+        compressed_header_format = '!dBHHBI'
+        compressed_header_size = struct.calcsize(compressed_header_format)
+        
+        if len(payload) >= compressed_header_size:
+            header_data = payload[:compressed_header_size]
+            timestamp, cam_id_byte, height, width, channels, compressed_size = struct.unpack(compressed_header_format, header_data)
+            
+            # Check if this looks like compressed data
+            if compressed_size > 0 and compressed_size == len(payload) - compressed_header_size:
+                # This is compressed data
+                compressed_data = payload[compressed_header_size:]
+                
+                # Decompress JPEG data
+                try:
+                    compressed_array = np.frombuffer(compressed_data, dtype=np.uint8)
+                    decoded_frame = cv2.imdecode(compressed_array, cv2.IMREAD_COLOR)
+                    
+                    if decoded_frame is None:
+                        print(f"Failed to decode JPEG data")
+                        return None
+                    
+                    # Convert back to original format if needed
+                    if channels == 1:
+                        frame = cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2GRAY)
+                    else:
+                        frame = decoded_frame
+                    
+                    camera_id_str = "left" if cam_id_byte == 1 else "right"
+                    
+                    if VERBOSE_LOGGING:
+                        print(f"Compressed frame parsed: {camera_id_str}, original=({height},{width},{channels}), "
+                              f"decompressed={frame.shape}, compressed_size={compressed_size}")
+                    
+                    return {"id": camera_id_str, "frame": frame, "ts": timestamp}
+                    
+                except Exception as e:
+                    print(f"Error decompressing JPEG data: {e}")
+                    return None
+        
+        # Fall back to uncompressed format
         header_format = '!dBHHB'  # timestamp, cam_id, height, width, channels
         header_size = struct.calcsize(header_format)
         if len(payload) < header_size: 
@@ -71,16 +115,15 @@ def parse_frame_payload(payload: bytes):
         frame_data = payload[header_size:]
         expected_size = height * width * channels
         if len(frame_data) != expected_size:
-            print(f"Incomplete data! H={height},W={width},C={channels} -> Expected:{expected_size}, Actual:{len(frame_data)}")
+            print(f"Incomplete uncompressed data! H={height},W={width},C={channels} -> Expected:{expected_size}, Actual:{len(frame_data)}")
             return None
 
         shape = (height, width, channels) if channels > 1 else (height, width)
         frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(shape)
         camera_id_str = "left" if cam_id_byte == 1 else "right"
         
-        # Only log detailed info if verbose logging is enabled
         if VERBOSE_LOGGING:
-            print(f"Frame parsed: {camera_id_str}, shape={frame.shape}, dtype={frame.dtype}, min={np.min(frame)}, max={np.max(frame)}")
+            print(f"Uncompressed frame parsed: {camera_id_str}, shape={frame.shape}, dtype={frame.dtype}")
         
         return {"id": camera_id_str, "frame": frame, "ts": timestamp}
     except Exception as e:

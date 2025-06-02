@@ -1,11 +1,12 @@
-# Aria UDP Sender - Direct image streaming without rotation
-# Connects to Aria device and sends raw image data via UDP
+# Aria UDP Sender - Direct image streaming with JPEG compression
+# Connects to Aria device and sends compressed image data via UDP
 
 import sys
 import time
 import socket
 import struct
 import numpy as np
+import cv2  # Added for JPEG compression
 import aria.sdk as aria
 from projectaria_tools.core.sensor_data import ImageDataRecord
 from common import update_iptables, quit_keypress
@@ -17,65 +18,86 @@ UPDATE_IPTABLES_ON_LINUX = True
 FORWARDING_IP = "127.0.0.1"
 FORWARDING_PORT = 9999
 STATS_PRINT_INTERVAL_SECONDS = 5.0
+JPEG_QUALITY = 85  # JPEG compression quality (1-100, higher = better quality but larger size)
 
 class UDPSender:
-    """UDP sender for image data with statistics tracking."""
+    """UDP sender for compressed image data with statistics tracking."""
     def __init__(self, host, port):
         self.target_address = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.MAX_UDP_PAYLOAD = 65507 - 28
-        self.FRAGMENT_HEADER_SIZE = 12
-        self.MAX_CHUNK_SIZE = self.MAX_UDP_PAYLOAD - self.FRAGMENT_HEADER_SIZE
-        self.packet_id_counter = 0
         
         self.frames_sent_count = 0
         self.bytes_sent_count = 0
+        self.compression_ratio_sum = 0.0
         self.start_time = time.time()
         
-        print(f"UDP Sender initialized, target: {host}:{port}")
+        print(f"UDP Sender initialized with JPEG compression (quality={JPEG_QUALITY}), target: {host}:{port}")
 
     def send_frame(self, frame: np.ndarray, camera_id_str: str, timestamp: float):
         try:
-            frame_contiguous = np.ascontiguousarray(frame)
-            height, width = frame_contiguous.shape[:2]
-            channels = frame_contiguous.shape[2] if frame_contiguous.ndim == 3 else 1
+            # Convert frame to uint8 if needed
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            
+            # Get original frame info
+            original_height, original_width = frame.shape[:2]
+            original_channels = frame.shape[2] if frame.ndim == 3 else 1
+            original_size = frame.nbytes
+            
+            # Convert grayscale to BGR for JPEG encoding if needed
+            if frame.ndim == 2:
+                frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            else:
+                frame_for_encoding = frame
+            
+            # JPEG compress the image
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            success, compressed_data = cv2.imencode('.jpg', frame_for_encoding, encode_param)
+            
+            if not success:
+                print(f"Failed to compress frame ({camera_id_str})")
+                return
+            
+            compressed_bytes = compressed_data.tobytes()
+            compressed_size = len(compressed_bytes)
+            
+            # Calculate compression ratio
+            compression_ratio = original_size / compressed_size if compressed_size > 0 else 1.0
+            self.compression_ratio_sum += compression_ratio
+            
             cam_id_byte = 1 if camera_id_str == 'left' else 2
             
-            header = struct.pack('!dBHHB', timestamp, cam_id_byte, height, width, channels)
-            frame_bytes = frame_contiguous.tobytes()
-            payload = header + frame_bytes
+            # Pack header: timestamp, cam_id, original_height, original_width, original_channels, compressed_size
+            header = struct.pack('!dBHHBI', timestamp, cam_id_byte, original_height, original_width, original_channels, compressed_size)
+            payload = header + compressed_bytes
 
+            # Check if payload fits in single UDP packet
             if len(payload) > self.MAX_UDP_PAYLOAD:
-                self._send_fragmented(payload)
-            else:
-                self.sock.sendto(b'SNGL' + payload, self.target_address)
+                print(f"Warning: Compressed frame still too large ({len(payload)} bytes), consider reducing JPEG_QUALITY")
+                return
+            
+            # Send as single packet
+            self.sock.sendto(b'COMP' + payload, self.target_address)
             
             self.frames_sent_count += 1
             self.bytes_sent_count += len(payload)
 
         except Exception as e:
-            print(f"Error sending frame ({camera_id_str}): {e}")
-
-    def _send_fragmented(self, data: bytes):
-        packet_id = self.packet_id_counter
-        self.packet_id_counter = (self.packet_id_counter + 1) % 65536
-        total_chunks = (len(data) + self.MAX_CHUNK_SIZE - 1) // self.MAX_CHUNK_SIZE
-        for i in range(total_chunks):
-            start = i * self.MAX_CHUNK_SIZE
-            chunk = data[start : start + self.MAX_CHUNK_SIZE]
-            fragment_header = b'FRAG' + struct.pack('!IHH', packet_id, i, total_chunks)
-            self.sock.sendto(fragment_header + chunk, self.target_address)
+            print(f"Error sending compressed frame ({camera_id_str}): {e}")
 
     def close(self):
         self.sock.close()
         elapsed_time = time.time() - self.start_time
         avg_fps = self.frames_sent_count / elapsed_time if elapsed_time > 1 else self.frames_sent_count
         avg_mbps = (self.bytes_sent_count * 8 / (1024*1024)) / elapsed_time if elapsed_time > 1 else (self.bytes_sent_count * 8 / (1024*1024))
+        avg_compression_ratio = self.compression_ratio_sum / self.frames_sent_count if self.frames_sent_count > 0 else 1.0
         
         print(f"UDP Sender closed.")
         print(f"  Total sent: {self.frames_sent_count} frames, {self.bytes_sent_count / (1024*1024):.2f} MB")
         print(f"  Runtime: {elapsed_time:.2f} seconds")
         print(f"  Average rate: {avg_fps:.1f} FPS, {avg_mbps:.2f} Mbps")
+        print(f"  Average compression ratio: {avg_compression_ratio:.1f}x")
 
 
 class AriaStreamObserver:

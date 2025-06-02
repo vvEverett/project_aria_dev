@@ -22,6 +22,7 @@ import numpy as np
 import traceback
 import signal
 import threading
+import cv2
 try:
     import zmq
 except ImportError:
@@ -43,6 +44,15 @@ STREAMING_PROFILE = "profile14"
 UPDATE_IPTABLES_ON_LINUX = True
 ZMQ_BIND_ADDRESS = "ipc:///tmp/aria_slam.ipc"  # IPC socket for faster local communication
 STATS_PRINT_INTERVAL_SECONDS = 5.0
+USE_UNDISTORTED_IMAGES = True  # Set to True to send undistorted images, False for raw images
+SAVE_CALIBRATION = False  # Set to True to save calibration data to file
+CALIBRATION_SAVE_PATH = "/home/developer/aria_workspace/device_calibration.json"  # Path to save calibration
+
+from projectaria_tools.core.calibration import (
+    device_calibration_from_json_string,
+    distort_by_calibration,
+    get_linear_camera_calibration,
+)
 
 class ZMQSender:
     """ZeroMQ sender for streaming SLAM image data with statistics tracking."""
@@ -204,11 +214,47 @@ class ZMQSender:
 class AriaStreamObserver:
     """Observer for receiving and caching latest images from Aria SDK."""
     
-    def __init__(self):
+    def __init__(self, device_calibration=None, use_undistorted=False):
         self.latest_data = {}
         self.frames_received_count_left = 0
         self.frames_received_count_right = 0
         self.sent_frame_ids = {}  # Track which frames have been sent
+        
+        # Store calibration info for undistortion
+        self.device_calibration = device_calibration
+        self.use_undistorted = use_undistorted
+        self.slam_left_calib = None
+        self.slam_right_calib = None
+        self.dst_left_calib = None
+        self.dst_right_calib = None
+        
+        # Initialize calibration if undistortion is enabled
+        if self.use_undistorted and self.device_calibration:
+            try:
+                self.slam_left_calib = self.device_calibration.get_camera_calib("camera-slam-left")
+                self.slam_right_calib = self.device_calibration.get_camera_calib("camera-slam-right")
+                
+                if self.slam_left_calib:
+                    # Get focal length from original calibration
+                    original_focal_lengths = self.slam_left_calib.get_focal_lengths()
+                    # Use average of fx and fy, or just fx
+                    focal_length = float(original_focal_lengths[0])  # or np.mean(original_focal_lengths)
+                    
+                    # Create linear calibration for undistorted output using original focal length
+                    self.dst_left_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-left")
+                    print(f"Left SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
+                
+                if self.slam_right_calib:
+                    # Get focal length from original calibration
+                    original_focal_lengths = self.slam_right_calib.get_focal_lengths()
+                    focal_length = float(original_focal_lengths[0])
+                    
+                    self.dst_right_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-right")
+                    print(f"Right SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
+                    
+            except Exception as e:
+                print(f"Warning: Could not load camera calibrations for undistortion: {e}")
+                self.use_undistorted = False
 
     def on_image_received(self, image: np.ndarray, record: ImageDataRecord):
         """Callback for new image data from Aria device."""
@@ -219,11 +265,27 @@ class AriaStreamObserver:
             self.frames_received_count_left += 1
         else:
             self.frames_received_count_right += 1
+        
+        # Process image (apply undistortion if enabled)
+        processed_image = image
+        if self.use_undistorted and self.device_calibration:
+            try:
+                if camera_id_str == "left" and self.slam_left_calib and self.dst_left_calib:
+                    # Apply undistortion directly to grayscale image
+                    processed_image = distort_by_calibration(image, self.dst_left_calib, self.slam_left_calib)
+                        
+                elif camera_id_str == "right" and self.slam_right_calib and self.dst_right_calib:
+                    # Apply undistortion directly to grayscale image
+                    processed_image = distort_by_calibration(image, self.dst_right_calib, self.slam_right_calib)
+                        
+            except Exception as e:
+                print(f"Warning: Undistortion failed for {camera_id_str} camera: {e}")
+                processed_image = image  # Fall back to raw image
             
         # Cache latest frame data with unique frame ID
         frame_id = f"{camera_id_str}_{record.capture_timestamp_ns}"
         self.latest_data[record.camera_id] = {
-            "image": image,
+            "image": processed_image,
             "timestamp": record.capture_timestamp_ns / 1e9,
             "frame_id": frame_id,
             "sent": False
@@ -266,6 +328,7 @@ def main():
     streaming_manager = None
     recording_manager = None
     streaming_client = None
+    device_calibration = None
 
     try:
         print(f"Connecting to Aria device: {DEVICE_IP}...")
@@ -295,6 +358,53 @@ def main():
         time.sleep(3)
         print("Pre-start cleanup finished.\n")
 
+        # Get device calibration for undistortion if needed or for saving
+        if USE_UNDISTORTED_IMAGES or SAVE_CALIBRATION:
+            try:
+                print("Loading device calibration...")
+                sensors_calib_json = streaming_manager.sensors_calibration()
+                
+                # Save calibration data to file if enabled
+                if SAVE_CALIBRATION and sensors_calib_json:
+                    try:
+                        import json
+                        import os
+                        
+                        # Parse and re-format JSON for better readability
+                        calib_data = json.loads(sensors_calib_json)
+                        
+                        # Ensure directory exists
+                        os.makedirs(os.path.dirname(CALIBRATION_SAVE_PATH), exist_ok=True)
+                        
+                        # Save with pretty formatting
+                        with open(CALIBRATION_SAVE_PATH, 'w') as f:
+                            json.dump(calib_data, f, indent=2, sort_keys=True)
+                        
+                        print(f"Device calibration saved to: {CALIBRATION_SAVE_PATH}")
+                        
+                        # Also save a timestamped version
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        timestamped_path = CALIBRATION_SAVE_PATH.replace('.json', f'_{timestamp}.json')
+                        with open(timestamped_path, 'w') as f:
+                            json.dump(calib_data, f, indent=2, sort_keys=True)
+                        print(f"Timestamped calibration saved to: {timestamped_path}")
+                        
+                    except Exception as e:
+                        print(f"Warning: Failed to save calibration data: {e}")
+                
+                # Parse calibration for undistortion if needed
+                if USE_UNDISTORTED_IMAGES:
+                    device_calibration = device_calibration_from_json_string(sensors_calib_json)
+                    if device_calibration:
+                        print("Device calibration loaded successfully for undistortion.")
+                    else:
+                        print("Warning: Could not parse device calibration, using raw images.")
+                        
+            except Exception as e:
+                print(f"Warning: Failed to load calibration: {e}")
+                if USE_UNDISTORTED_IMAGES:
+                    print("Using raw images due to calibration failure.")
+
         # Configure and start streaming
         streaming_client = streaming_manager.streaming_client
         streaming_config = aria.StreamingConfig()
@@ -311,11 +421,13 @@ def main():
         streaming_client.subscription_config = sub_config
 
         # Initialize observer and ZMQ sender
-        observer = AriaStreamObserver()
+        observer = AriaStreamObserver(device_calibration, USE_UNDISTORTED_IMAGES)
         sender = ZMQSender(ZMQ_BIND_ADDRESS)
         streaming_client.set_streaming_client_observer(observer)
         streaming_client.subscribe()
-        print("Subscribed to SLAM data stream, starting ZMQ transmission...")
+        
+        image_type_str = "undistorted" if USE_UNDISTORTED_IMAGES else "raw"
+        print(f"Subscribed to SLAM data stream, starting ZMQ transmission ({image_type_str} images)...")
 
         # Statistics tracking variables
         last_stats_print_time = time.time()

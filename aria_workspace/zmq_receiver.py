@@ -1,11 +1,20 @@
-# ZMQ Receiver for Aria SLAM - Receives and displays stereo camera streams
-# Designed to run outside Docker container and receive from containerized sender
+# Aria SLAM ZMQ Stereo Receiver
+# 
+# Receives and displays stereo camera streams via ZeroMQ (ZMQ) IPC.
+# Designed to run outside the Docker container and connect to a containerized sender.
+# Uses raw (uncompressed) image data for low-latency visualization.
+# Supports saving stereo image pairs to disk with timestamped filenames.
+# Press 'q' to quit, 's' to save the current stereo pair.
+# 
+# Author: [Your Name or Organization]
+# Date: [Optional]
 
 import struct
 import numpy as np
 import cv2
 import time
 import threading
+import os
 from queue import LifoQueue, Empty
 
 try:
@@ -19,6 +28,7 @@ ZMQ_CONNECT_ADDRESS = "ipc:///tmp/aria_slam.ipc"  # IPC socket for local communi
 ROTATION_K = -1  # np.rot90 k parameter: -1=counterclockwise 90°, 1=clockwise 90°
 VERBOSE_LOGGING = False  # Set to True for detailed frame parsing logs
 HEARTBEAT_TIMEOUT = 5.0  # Seconds without heartbeat before connection warning
+SAVE_BASE_DIR = "/home/vv"  # Base directory for saving images
 # =============================================================
 
 def parse_frame_payload(payload: bytes):
@@ -164,6 +174,34 @@ def zmq_receive_thread(context, connect_address, stereo_pair_queue, running_flag
     print("ZMQ receiver thread stopped.")
 
 
+def save_stereo_images(left_frame, right_frame):
+    """Save stereo images to Aria_image folder structure."""
+    try:
+        # Create timestamp for filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S_%f", time.localtime())[:-3]  # Remove last 3 digits of microseconds
+        
+        # Create folder structure: Aria_image/slam_left and Aria_image/slam_right
+        aria_folder = os.path.join(SAVE_BASE_DIR, "Aria_image")
+        left_folder = os.path.join(aria_folder, "slam_left")
+        right_folder = os.path.join(aria_folder, "slam_right")
+        
+        # Create directories
+        os.makedirs(left_folder, exist_ok=True)
+        os.makedirs(right_folder, exist_ok=True)
+        
+        # Save images with timestamp filename
+        left_path = os.path.join(left_folder, f"{timestamp}.png")
+        right_path = os.path.join(right_folder, f"{timestamp}.png")
+        
+        cv2.imwrite(left_path, left_frame)
+        cv2.imwrite(right_path, right_frame)
+        
+        print(f"Images saved: {left_path} and {right_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving images: {e}")
+        return False
+
 def main():
     """Main function for ZMQ receiver application."""
     
@@ -205,7 +243,7 @@ def main():
     connection_warning_shown = False
 
     try:
-        print("ZMQ receiver started. Press 'q' to quit.")
+        print("ZMQ receiver started. Press 'q' to quit, 's' to save current stereo pair.")
         
         while True:
             # Try to get latest stereo pair from queue
@@ -258,9 +296,15 @@ def main():
                     print("Connected! Waiting for frames...")
                     connection_warning_shown = False
 
-            # Check for quit key
-            if cv2.waitKey(10) & 0xFF == ord('q'):
+            # Check for quit key and save key
+            key = cv2.waitKey(10) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('s') and current_left_img_raw is not None and current_right_img_raw is not None:
+                # Save current stereo pair
+                left_rotated = np.rot90(current_left_img_raw, k=ROTATION_K)
+                right_rotated = np.rot90(current_right_img_raw, k=ROTATION_K)
+                save_stereo_images(left_rotated, right_rotated)
 
     except KeyboardInterrupt:
         print("\nUser interrupted.")

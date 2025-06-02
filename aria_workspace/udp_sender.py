@@ -1,5 +1,9 @@
-# Aria UDP Sender - Direct image streaming with JPEG compression
-# Connects to Aria device and sends compressed image data via UDP
+# Aria SLAM UDP Sender
+#
+# Connects to an Aria device, captures stereo camera images, compresses them using JPEG,
+# and streams the compressed data over UDP to a specified target.
+# Tracks and prints transmission statistics. Supports Linux iptables update for local forwarding.
+#
 
 import sys
 import time

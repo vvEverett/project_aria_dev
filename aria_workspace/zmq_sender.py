@@ -1,5 +1,19 @@
-# Aria ZMQ Sender - Streams SLAM data from Aria device via ZeroMQ
-# Designed to run inside Docker container and transmit to external receiver
+# Aria SLAM ZMQ Sender
+#
+# Connects to an Aria device, captures stereo camera images, and streams raw (uncompressed) image data
+# via ZeroMQ (ZMQ) IPC to external receivers. Designed for use inside a Docker container.
+# Sends periodic heartbeat messages for connection monitoring and prints transmission statistics.
+#
+# Prerequisites:
+# - Aria SDK (projectaria_client_sdk)
+# - pyzmq
+#
+# Configuration:
+# - DEVICE_IP: IP address of the Aria device
+# - STREAMING_PROFILE: Streaming profile name
+# - UPDATE_IPTABLES_ON_LINUX: Whether to update iptables on Linux
+# - ZMQ_BIND_ADDRESS: ZeroMQ bind address (IPC or TCP)
+# - STATS_PRINT_INTERVAL_SECONDS: Interval for printing transmission statistics
 
 import sys
 import time

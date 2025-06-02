@@ -1,4 +1,10 @@
-# UDP Receiver for Aria SLAM - Receives and decompresses images
+# Aria SLAM UDP Stereo Receiver
+#
+# Receives stereo camera streams over UDP, supporting both compressed (JPEG) and uncompressed image formats.
+# Handles fragmented UDP packets and reassembles them into complete frames.
+# Displays stereo image pairs in real time, with support for saving images to disk.
+# Press 'q' to quit, 's' to save the current stereo pair.
+#
 
 import socket
 import struct
@@ -6,6 +12,7 @@ import numpy as np
 import cv2
 import time
 import threading
+import os
 from queue import LifoQueue, Empty
 
 # ======================= Configuration =======================
@@ -14,6 +21,7 @@ LISTEN_PORT = 9999
 BUFFER_SIZE = 65536
 ROTATION_K = -1  # np.rot90 k parameter: -1=counterclockwise 90°, 1=clockwise 90°
 VERBOSE_LOGGING = False  # Set to True for detailed frame parsing logs
+SAVE_BASE_DIR = "/home/vv"  # Base directory for saving images
 # =============================================================
 
 class FrameReassembler:
@@ -175,6 +183,34 @@ def receive_thread_func(sock, stereo_pair_queue, reassembler, running_flag):
             if running_flag.is_set():
                 print(f"Receiver thread error: {e}")
 
+def save_stereo_images(left_frame, right_frame):
+    """Save stereo images to Aria_image folder structure."""
+    try:
+        # Create timestamp for filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S_%f", time.localtime())[:-3]  # Remove last 3 digits of microseconds
+        
+        # Create folder structure: Aria_image/slam_left and Aria_image/slam_right
+        aria_folder = os.path.join(SAVE_BASE_DIR, "Aria_image")
+        left_folder = os.path.join(aria_folder, "slam_left")
+        right_folder = os.path.join(aria_folder, "slam_right")
+        
+        # Create directories
+        os.makedirs(left_folder, exist_ok=True)
+        os.makedirs(right_folder, exist_ok=True)
+        
+        # Save images with timestamp filename
+        left_path = os.path.join(left_folder, f"{timestamp}.png")
+        right_path = os.path.join(right_folder, f"{timestamp}.png")
+        
+        cv2.imwrite(left_path, left_frame)
+        cv2.imwrite(right_path, right_frame)
+        
+        print(f"Images saved: {left_path} and {right_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving images: {e}")
+        return False
+
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.0)
@@ -256,8 +292,14 @@ def main():
                 except Exception as e:
                     print(f"Display error: {e}")
             
-            if cv2.waitKey(10) & 0xFF == ord('q'):
+            key = cv2.waitKey(10) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('s') and current_left_img_raw is not None and current_right_img_raw is not None:
+                # Save current stereo pair
+                rotated_left = np.rot90(current_left_img_raw, ROTATION_K)
+                rotated_right = np.rot90(current_right_img_raw, ROTATION_K)
+                save_stereo_images(rotated_left, rotated_right)
 
     except KeyboardInterrupt:
         print("\nUser interrupted.")

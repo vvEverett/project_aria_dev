@@ -13,11 +13,15 @@ import numpy as np
 import cv2  # Added for JPEG compression
 import aria.sdk as aria
 from projectaria_tools.core.sensor_data import ImageDataRecord
-from common import update_iptables, quit_keypress
+from common import update_iptables, quit_keypress, ctrl_c_handler
+from aria_utils import (
+    AriaDeviceManager, CalibrationManager, BaseAriaStreamObserver, 
+    TransmissionStatistics, setup_aria_sdk, get_camera_id_string, get_camera_id_byte
+)
 
 # Configuration
 DEVICE_IP = "192.168.3.41"
-STREAMING_PROFILE = "profile14"
+STREAMING_PROFILE = "profile18"
 UPDATE_IPTABLES_ON_LINUX = True
 FORWARDING_IP = "127.0.0.1"
 FORWARDING_PORT = 9999
@@ -26,14 +30,23 @@ JPEG_QUALITY = 85  # JPEG compression quality (1-100, higher = better quality bu
 USE_UNDISTORTED_IMAGES = True  # Set to True to send undistorted images, False for raw images
 SAVE_CALIBRATION = False  # Set to True to save calibration data to file
 CALIBRATION_SAVE_PATH = "/home/developer/aria_workspace/device_calibration.json"  # Path to save calibration
+ENABLE_RGB_STREAM = True  # Set to True to enable RGB stream capture and transmission
 
-from projectaria_tools.core.calibration import (
-    device_calibration_from_json_string,
-    distort_by_calibration,
-    get_linear_camera_calibration,
-)
+# Left SLAM camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True
+LEFT_UNDISTORT_OUTPUT_WIDTH = 640    # Output width for left undistorted images
+LEFT_UNDISTORT_OUTPUT_HEIGHT = 480   # Output height for left undistorted images  
+LEFT_UNDISTORT_FOCAL_LENGTH = None   # Focal length for left undistorted output (None = use original from calibration)
 
-# ...existing code...
+# Right SLAM camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True
+RIGHT_UNDISTORT_OUTPUT_WIDTH = 640    # Output width for right undistorted images
+RIGHT_UNDISTORT_OUTPUT_HEIGHT = 480   # Output height for right undistorted images
+RIGHT_UNDISTORT_FOCAL_LENGTH = None   # Focal length for right undistorted output (None = use original from calibration)
+
+# RGB camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True and ENABLE_RGB_STREAM is True
+RGB_UNDISTORT_OUTPUT_WIDTH = 512     # Output width for RGB undistorted images
+RGB_UNDISTORT_OUTPUT_HEIGHT = 512    # Output height for RGB undistorted images
+RGB_UNDISTORT_FOCAL_LENGTH = None    # Focal length for RGB undistorted output (None = use original from calibration)
+
 
 class UDPSender:
     """UDP sender for compressed image data with statistics tracking."""
@@ -81,7 +94,7 @@ class UDPSender:
             compression_ratio = original_size / compressed_size if compressed_size > 0 else 1.0
             self.compression_ratio_sum += compression_ratio
             
-            cam_id_byte = 1 if camera_id_str == 'left' else 2
+            cam_id_byte = get_camera_id_byte(camera_id_str)
             
             # Pack header: timestamp, cam_id, original_height, original_width, original_channels, compressed_size
             header = struct.pack('!dBHHBI', timestamp, cam_id_byte, original_height, original_width, original_channels, compressed_size)
@@ -115,245 +128,97 @@ class UDPSender:
         print(f"  Average compression ratio: {avg_compression_ratio:.1f}x")
 
 
-class AriaStreamObserver:
-    """Observer for caching latest images from Aria SDK."""
-    def __init__(self, device_calibration=None, use_undistorted=False):
-        self.latest_data = {}
-        self.frames_received_count_left = 0
-        self.frames_received_count_right = 0
-        
-        # Store calibration info for undistortion
-        self.device_calibration = device_calibration
-        self.use_undistorted = use_undistorted
-        self.slam_left_calib = None
-        self.slam_right_calib = None
-        self.dst_left_calib = None
-        self.dst_right_calib = None
-        
-        # Initialize calibration if undistortion is enabled
-        if self.use_undistorted and self.device_calibration:
-            try:
-                self.slam_left_calib = self.device_calibration.get_camera_calib("camera-slam-left")
-                self.slam_right_calib = self.device_calibration.get_camera_calib("camera-slam-right")
-                
-                if self.slam_left_calib:
-                    # Get focal length from original calibration
-                    original_focal_lengths = self.slam_left_calib.get_focal_lengths()
-                    focal_length = float(original_focal_lengths[0])
-                    
-                    # Create linear calibration for undistorted output using original focal length
-                    self.dst_left_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-left")
-                    print(f"Left SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
-                
-                if self.slam_right_calib:
-                    # Get focal length from original calibration
-                    original_focal_lengths = self.slam_right_calib.get_focal_lengths()
-                    focal_length = float(original_focal_lengths[0])
-                    
-                    self.dst_right_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-right")
-                    print(f"Right SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
-                    
-            except Exception as e:
-                print(f"Warning: Could not load camera calibrations for undistortion: {e}")
-                self.use_undistorted = False
-
-    def on_image_received(self, image: np.ndarray, record: ImageDataRecord):
-        camera_id_str = "left" if record.camera_id == aria.CameraId.Slam1 else "right"
-        if camera_id_str == "left":
-            self.frames_received_count_left += 1
-        else:
-            self.frames_received_count_right += 1
-        
-        # Process image (apply undistortion if enabled)
-        processed_image = image
-        if self.use_undistorted and self.device_calibration:
-            try:
-                if camera_id_str == "left" and self.slam_left_calib and self.dst_left_calib:
-                    # Apply undistortion directly to grayscale image
-                    processed_image = distort_by_calibration(image, self.dst_left_calib, self.slam_left_calib)
-                        
-                elif camera_id_str == "right" and self.slam_right_calib and self.dst_right_calib:
-                    # Apply undistortion directly to grayscale image
-                    processed_image = distort_by_calibration(image, self.dst_right_calib, self.slam_right_calib)
-                        
-            except Exception as e:
-                print(f"Warning: Undistortion failed for {camera_id_str} camera: {e}")
-                processed_image = image  # Fall back to raw image
-            
+class AriaStreamObserver(BaseAriaStreamObserver):
+    """Observer for caching latest images from Aria SDK with UDP-specific functionality."""
+    
+    def _store_frame_data(self, record, processed_image, camera_id_str):
+        """Store frame data for UDP transmission."""
         self.latest_data[record.camera_id] = {
             "image": processed_image,
             "timestamp": record.capture_timestamp_ns / 1e9
         }
 
+
 def main():
     if UPDATE_IPTABLES_ON_LINUX and sys.platform.startswith("linux"):
         update_iptables()
-    aria.set_log_level(aria.Level.Warning)
     
-    device_client = aria.DeviceClient()
+    setup_aria_sdk()
+    
+    # Initialize managers
+    device_manager = AriaDeviceManager(DEVICE_IP, STREAMING_PROFILE, ENABLE_RGB_STREAM)
     sender = None
-    device = None
-    streaming_manager = None
-    recording_manager = None
-    streaming_client = None
-    device_calibration = None
+    observer = None
+    calibration_manager = None
 
     try:
-        print(f"Connecting to Aria device: {DEVICE_IP}...")
-        client_config = aria.DeviceClientConfig()
-        client_config.ip_v4_address = DEVICE_IP
-        device_client.set_client_config(client_config)
-        device = device_client.connect()
-        print("Device connected successfully.")
+        # Connect and setup device
+        device_manager.connect()
+        device_manager.stop_existing_sessions()
 
-        print("Attempting to stop any active sessions...")
-        streaming_manager = device.streaming_manager
-        recording_manager = device.recording_manager
-        
-        try:
-            streaming_manager.stop_streaming()
-            print("  Existing streaming stopped.")
-        except Exception as e:
-            print(f"  Note (stopping stream): {e}")
-            
-        try:
-            recording_manager.stop_recording()
-            print("  Existing recording stopped.")
-        except Exception as e:
-            print(f"  Note (stopping recording): {e}")
-        
-        time.sleep(3)
-        print("Pre-start cleanup finished.\n")
-
-        # Get device calibration for undistortion if needed or for saving
+        # Handle calibration
+        device_calibration = None
         if USE_UNDISTORTED_IMAGES or SAVE_CALIBRATION:
-            try:
-                print("Loading device calibration...")
-                sensors_calib_json = streaming_manager.sensors_calibration()
-                
-                # Save calibration data to file if enabled
-                if SAVE_CALIBRATION and sensors_calib_json:
-                    try:
-                        import json
-                        import os
-                        
-                        # Parse and re-format JSON for better readability
-                        calib_data = json.loads(sensors_calib_json)
-                        
-                        # Ensure directory exists
-                        os.makedirs(os.path.dirname(CALIBRATION_SAVE_PATH), exist_ok=True)
-                        
-                        # Save with pretty formatting
-                        with open(CALIBRATION_SAVE_PATH, 'w') as f:
-                            json.dump(calib_data, f, indent=2, sort_keys=True)
-                        
-                        print(f"Device calibration saved to: {CALIBRATION_SAVE_PATH}")
-                        
-                        # Also save a timestamped version
-                        timestamp = time.strftime("%Y%m%d_%H%M%S")
-                        timestamped_path = CALIBRATION_SAVE_PATH.replace('.json', f'_{timestamp}.json')
-                        with open(timestamped_path, 'w') as f:
-                            json.dump(calib_data, f, indent=2, sort_keys=True)
-                        print(f"Timestamped calibration saved to: {timestamped_path}")
-                        
-                    except Exception as e:
-                        print(f"Warning: Failed to save calibration data: {e}")
-                
-                # Parse calibration for undistortion if needed
-                if USE_UNDISTORTED_IMAGES:
-                    device_calibration = device_calibration_from_json_string(sensors_calib_json)
-                    if device_calibration:
-                        print("Device calibration loaded successfully for undistortion.")
-                    else:
-                        print("Warning: Could not parse device calibration, using raw images.")
-                        
-            except Exception as e:
-                print(f"Warning: Failed to load calibration: {e}")
-                if USE_UNDISTORTED_IMAGES:
-                    print("Using raw images due to calibration failure.")
+            device_calibration = device_manager.get_calibration(SAVE_CALIBRATION, CALIBRATION_SAVE_PATH)
+            if USE_UNDISTORTED_IMAGES and not device_calibration:
+                print("Using raw images due to calibration failure.")
 
-        streaming_client = streaming_manager.streaming_client
-        streaming_config = aria.StreamingConfig()
-        streaming_config.profile_name = STREAMING_PROFILE
-        streaming_config.security_options.use_ephemeral_certs = True
-        streaming_manager.streaming_config = streaming_config
-        streaming_manager.start_streaming()
-        print(f"Streaming started with profile: {STREAMING_PROFILE}")
-
-        # Configure the streaming client to subscribe to SLAM data
-        sub_config = streaming_client.subscription_config
-        sub_config.subscriber_data_type = aria.StreamingDataType.Slam
-        sub_config.message_queue_size[aria.StreamingDataType.Slam] = 5
-        streaming_client.subscription_config = sub_config
-
-        observer = AriaStreamObserver(device_calibration, USE_UNDISTORTED_IMAGES)
+        # Initialize calibration manager and observer
+        calibration_manager = CalibrationManager(
+            device_calibration, 
+            USE_UNDISTORTED_IMAGES,
+            LEFT_UNDISTORT_OUTPUT_WIDTH, LEFT_UNDISTORT_OUTPUT_HEIGHT, LEFT_UNDISTORT_FOCAL_LENGTH,
+            RIGHT_UNDISTORT_OUTPUT_WIDTH, RIGHT_UNDISTORT_OUTPUT_HEIGHT, RIGHT_UNDISTORT_FOCAL_LENGTH,
+            RGB_UNDISTORT_OUTPUT_WIDTH, RGB_UNDISTORT_OUTPUT_HEIGHT, RGB_UNDISTORT_FOCAL_LENGTH
+        )
+        observer = AriaStreamObserver(calibration_manager)
         sender = UDPSender(FORWARDING_IP, FORWARDING_PORT)
-        streaming_client.set_streaming_client_observer(observer)
-        streaming_client.subscribe()
+
+        # Start streaming
+        device_manager.start_streaming()
+        device_manager.streaming_client.set_streaming_client_observer(observer)
+        device_manager.streaming_client.subscribe()
         
         image_type_str = "undistorted" if USE_UNDISTORTED_IMAGES else "raw"
-        print(f"Subscribed to SLAM data stream, starting UDP transmission ({image_type_str} images with JPEG compression)...")
+        stream_types = "SLAM"
+        if ENABLE_RGB_STREAM:
+            stream_types += " + RGB"
+        print(f"Subscribed to {stream_types} data stream, starting UDP transmission ({image_type_str} images with JPEG compression)...")
 
-        last_stats_print_time = time.time()
-        frames_since_last_stats_left = 0
-        frames_since_last_stats_right = 0
-        frames_received_since_last_stats_left = 0
-        frames_received_since_last_stats_right = 0
-        total_frames_sent_left = 0
-        total_frames_sent_right = 0
-        last_received_count_left = 0
-        last_received_count_right = 0
+        # Initialize statistics tracking
+        stats = TransmissionStatistics(STATS_PRINT_INTERVAL_SECONDS)
         
-        while not quit_keypress():
-            current_loop_time = time.time()
-            available_cameras = list(observer.latest_data.keys())
-            
-            processed_in_loop = False
-            for cam_id in available_cameras:
-                data = observer.latest_data.pop(cam_id, None)
-                if data:
-                    processed_in_loop = True
-                    camera_id_str = "left" if cam_id == aria.CameraId.Slam1 else "right"
-                    original_image = data["image"]
-                    sender.send_frame(original_image, camera_id_str, data["timestamp"])
-                    
-                    if camera_id_str == "left":
-                        frames_since_last_stats_left += 1
-                        total_frames_sent_left +=1
-                    else:
-                        frames_since_last_stats_right += 1
-                        total_frames_sent_right += 1
-            
-            if current_loop_time - last_stats_print_time >= STATS_PRINT_INTERVAL_SECONDS:
-                elapsed_interval = current_loop_time - last_stats_print_time
+        # Use unified signal handling from common module
+        with ctrl_c_handler() as ctrl_c:
+            while not (quit_keypress() or ctrl_c):
+                current_loop_time = time.time()
+                available_cameras = list(observer.latest_data.keys())
                 
-                # Calculate sent FPS
-                fps_sent_left = frames_since_last_stats_left / elapsed_interval if elapsed_interval > 0 else 0
-                fps_sent_right = frames_since_last_stats_right / elapsed_interval if elapsed_interval > 0 else 0
-                
-                # Calculate received FPS
-                current_received_left = observer.frames_received_count_left
-                current_received_right = observer.frames_received_count_right
-                frames_received_since_last_stats_left = current_received_left - last_received_count_left
-                frames_received_since_last_stats_right = current_received_right - last_received_count_right
-                fps_received_left = frames_received_since_last_stats_left / elapsed_interval if elapsed_interval > 0 else 0
-                fps_received_right = frames_received_since_last_stats_right / elapsed_interval if elapsed_interval > 0 else 0
-                
-                print(f"STATUS [{time.strftime('%H:%M:%S')}]: "
-                      f"L_Recv={fps_received_left:.1f}, L_Send={fps_sent_left:.1f} | "
-                      f"R_Recv={fps_received_right:.1f}, R_Send={fps_sent_right:.1f} | "
-                      f"Total L={total_frames_sent_left}, R={total_frames_sent_right}")
-                
-                frames_since_last_stats_left = 0
-                frames_since_last_stats_right = 0
-                last_received_count_left = current_received_left
-                last_received_count_right = current_received_right
-                last_stats_print_time = current_loop_time
+                processed_in_loop = False
+                for cam_id in available_cameras:
+                    data = observer.latest_data.pop(cam_id, None)
+                    if data:
+                        processed_in_loop = True
+                        # Use the corrected get_camera_id_string function
+                        if cam_id == aria.CameraId.Slam1:
+                            camera_id_str = "left"
+                        elif cam_id == aria.CameraId.Slam2:
+                            camera_id_str = "right"
+                        elif cam_id == aria.CameraId.Rgb:
+                            camera_id_str = "rgb"
+                        else:
+                            continue  # Skip unknown camera types
+                        
+                        sender.send_frame(data["image"], camera_id_str, data["timestamp"])
+                        stats.update_sent_count(camera_id_str)
 
-            if not processed_in_loop:
-                time.sleep(0.005)
-            else:
-                time.sleep(0.001)
+                if stats.should_print_stats():
+                    stats.print_stats(observer)
+
+                if not processed_in_loop:
+                    time.sleep(0.005)
+                else:
+                    time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nUser interrupted (Ctrl+C).")
@@ -371,31 +236,7 @@ def main():
         else:
             print("  UDP sender was not initialized.")
 
-        if device is not None:
-            if streaming_client is not None:
-                try:
-                    print("  Unsubscribing from Aria stream...")
-                    streaming_client.unsubscribe()
-                    print("    Successfully unsubscribed.")
-                except Exception as e_unsub:
-                    print(f"    Error unsubscribing: {e_unsub}")
-            
-            if streaming_manager is not None:
-                try:
-                    print(f"  Stopping Aria device streaming...")
-                    streaming_manager.stop_streaming()
-                    print("    Streaming stopped successfully.")
-                except Exception as e_sm:
-                    print(f"    Error stopping stream: {e_sm}")
-            
-            try:
-                print(f"  Disconnecting from Aria device...")
-                device_client.disconnect(device)
-                print("    Disconnected from device.")
-            except Exception as e_dc:
-                print(f"    Error disconnecting: {e_dc}")
-        else:
-            print("  Aria device was not connected.")
+        device_manager.cleanup()
         
         time.sleep(0.5)
         print("Cleanup complete.")

@@ -1,13 +1,10 @@
-# Aria SLAM ZMQ Stereo Receiver
+# Aria SLAM + RGB ZMQ Receiver
 # 
-# Receives and displays stereo camera streams via ZeroMQ (ZMQ) IPC.
+# Receives and displays stereo camera streams + RGB camera via ZeroMQ (ZMQ) IPC.
 # Designed to run outside the Docker container and connect to a containerized sender.
 # Uses raw (uncompressed) image data for low-latency visualization.
-# Supports saving stereo image pairs to disk with timestamped filenames.
-# Press 'q' to quit, 's' to save the current stereo pair.
-# 
-# Author: [Your Name or Organization]
-# Date: [Optional]
+# Supports saving stereo image pairs and RGB images to disk with timestamped filenames.
+# Press 'q' to quit, 's' to save the current images.
 
 import struct
 import numpy as np
@@ -29,6 +26,7 @@ ROTATION_K = -1  # np.rot90 k parameter: -1=counterclockwise 90°, 1=clockwise 9
 VERBOSE_LOGGING = False  # Set to True for detailed frame parsing logs
 HEARTBEAT_TIMEOUT = 5.0  # Seconds without heartbeat before connection warning
 SAVE_BASE_DIR = "/home/vv"  # Base directory for saving images
+ENABLE_RGB_DISPLAY = True  # Set to True to display RGB camera
 # =============================================================
 
 def parse_frame_payload(payload: bytes):
@@ -50,7 +48,16 @@ def parse_frame_payload(payload: bytes):
 
         shape = (height, width, channels) if channels > 1 else (height, width)
         frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(shape)
-        camera_id_str = "left" if cam_id_byte == 1 else "right"
+        
+        # Updated camera ID mapping to handle RGB
+        if cam_id_byte == 1:
+            camera_id_str = "left"
+        elif cam_id_byte == 2:
+            camera_id_str = "right"
+        elif cam_id_byte == 3:
+            camera_id_str = "rgb"
+        else:
+            camera_id_str = f"unknown_{cam_id_byte}"
         
         # Only log detailed info if verbose logging is enabled
         if VERBOSE_LOGGING:
@@ -62,27 +69,28 @@ def parse_frame_payload(payload: bytes):
         return None
 
 
-def zmq_receive_thread(context, connect_address, stereo_pair_queue, running_flag, connection_status):
-    """ZeroMQ receiver thread - subscribes to SLAM topics and assembles stereo pairs."""
+def zmq_receive_thread(context, connect_address, frame_queue, running_flag, connection_status):
+    """ZeroMQ receiver thread - subscribes to SLAM and RGB topics."""
     
     socket = context.socket(zmq.SUB)
     socket.connect(connect_address)
     
-    # Subscribe to SLAM camera topics and heartbeat
+    # Subscribe to SLAM camera topics, RGB topic, and heartbeat
     socket.setsockopt(zmq.SUBSCRIBE, b"slam.left")
-    socket.setsockopt(zmq.SUBSCRIBE, b"slam.right") 
+    socket.setsockopt(zmq.SUBSCRIBE, b"slam.right")
+    socket.setsockopt(zmq.SUBSCRIBE, b"slam.rgb")  # Subscribe to RGB topic
     socket.setsockopt(zmq.SUBSCRIBE, b"heartbeat")
     
     # Set socket timeout for non-blocking receives
     socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
     
     print(f"ZMQ receiver connected to: {connect_address}")
-    print("Subscribed to topics: slam.left, slam.right, heartbeat")
+    print("Subscribed to topics: slam.left, slam.right, slam.rgb, heartbeat")
     
     temp_frames_buffer = {}
-    frame_count = {"left": 0, "right": 0}
+    frame_count = {"left": 0, "right": 0, "rgb": 0}
     last_stats_time = time.time()
-    last_frame_count = {"left": 0, "right": 0}
+    last_frame_count = {"left": 0, "right": 0, "rgb": 0}
     last_heartbeat_time = time.time()
     
     while running_flag.is_set():
@@ -120,36 +128,32 @@ def zmq_receive_thread(context, connect_address, stereo_pair_queue, running_flag
                         time_diff = current_time - last_stats_time
                         left_fps = (frame_count["left"] - last_frame_count["left"]) / time_diff
                         right_fps = (frame_count["right"] - last_frame_count["right"]) / time_diff
+                        rgb_fps = (frame_count["rgb"] - last_frame_count["rgb"]) / time_diff
                         
                         timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
-                        print(f"[{timestamp}] Received FPS: Left={left_fps:.1f}, Right={right_fps:.1f} | "
-                              f"Total frames: L={frame_count['left']} R={frame_count['right']}")
+                        print(f"[{timestamp}] Received FPS: Left={left_fps:.1f}, Right={right_fps:.1f}, RGB={rgb_fps:.1f} | "
+                              f"Total frames: L={frame_count['left']} R={frame_count['right']} RGB={frame_count['rgb']}")
                         
                         last_frame_count = frame_count.copy()
                         last_stats_time = current_time
                     
-                    # Check if we have both left and right frames for stereo pair
-                    if 'left' in temp_frames_buffer and 'right' in temp_frames_buffer:
-                        stereo_data = {
-                            "left_frame": temp_frames_buffer["left"]["frame"],
-                            "right_frame": temp_frames_buffer["right"]["frame"],
-                            "left_timestamp": temp_frames_buffer["left"]["ts"],
-                            "right_timestamp": temp_frames_buffer["right"]["ts"]
-                        }
-                        
-                        # Try to put stereo pair in queue (non-blocking)
+                    # Put individual frames in queue for display
+                    frame_data = {
+                        "camera_id": camera_id,
+                        "frame": parsed_data["frame"],
+                        "timestamp": parsed_data["ts"]
+                    }
+                    
+                    # Try to put frame in queue (non-blocking)
+                    try:
+                        frame_queue.put_nowait(frame_data)
+                    except:
+                        # Queue is full, discard oldest and add new
                         try:
-                            stereo_pair_queue.put_nowait(stereo_data)
+                            frame_queue.get_nowait()
+                            frame_queue.put_nowait(frame_data)
                         except:
-                            # Queue is full, discard oldest and add new
-                            try:
-                                stereo_pair_queue.get_nowait()
-                                stereo_pair_queue.put_nowait(stereo_data)
-                            except:
-                                pass
-                        
-                        # Clear buffer after creating stereo pair
-                        temp_frames_buffer.clear()
+                            pass
             
             # Check for connection timeout
             if current_time - last_heartbeat_time > HEARTBEAT_TIMEOUT:
@@ -174,33 +178,48 @@ def zmq_receive_thread(context, connect_address, stereo_pair_queue, running_flag
     print("ZMQ receiver thread stopped.")
 
 
-def save_stereo_images(left_frame, right_frame):
-    """Save stereo images to Aria_image folder structure."""
+def save_images(left_frame=None, right_frame=None, rgb_frame=None):
+    """Save images to Aria_image folder structure."""
     try:
         # Create timestamp for filename
         timestamp = time.strftime("%Y%m%d_%H%M%S_%f", time.localtime())[:-3]  # Remove last 3 digits of microseconds
         
-        # Create folder structure: Aria_image/slam_left and Aria_image/slam_right
+        # Create folder structure
         aria_folder = os.path.join(SAVE_BASE_DIR, "Aria_image")
-        left_folder = os.path.join(aria_folder, "slam_left")
-        right_folder = os.path.join(aria_folder, "slam_right")
+        folders = {
+            "slam_left": os.path.join(aria_folder, "slam_left"),
+            "slam_right": os.path.join(aria_folder, "slam_right"),
+            "rgb": os.path.join(aria_folder, "rgb")  # RGB is now grayscale
+        }
         
         # Create directories
-        os.makedirs(left_folder, exist_ok=True)
-        os.makedirs(right_folder, exist_ok=True)
+        for folder in folders.values():
+            os.makedirs(folder, exist_ok=True)
+        
+        saved_files = []
         
         # Save images with timestamp filename
-        left_path = os.path.join(left_folder, f"{timestamp}.png")
-        right_path = os.path.join(right_folder, f"{timestamp}.png")
+        if left_frame is not None:
+            left_path = os.path.join(folders["slam_left"], f"{timestamp}.png")
+            cv2.imwrite(left_path, left_frame)
+            saved_files.append(left_path)
         
-        cv2.imwrite(left_path, left_frame)
-        cv2.imwrite(right_path, right_frame)
+        if right_frame is not None:
+            right_path = os.path.join(folders["slam_right"], f"{timestamp}.png")
+            cv2.imwrite(right_path, right_frame)
+            saved_files.append(right_path)
         
-        print(f"Images saved: {left_path} and {right_path}")
-        return True
+        if rgb_frame is not None:
+            rgb_path = os.path.join(folders["rgb"], f"{timestamp}.png")
+            cv2.imwrite(rgb_path, rgb_frame)  # OpenCV handles grayscale automatically
+            saved_files.append(rgb_path)
+        
+        if saved_files:
+            print(f"Images saved: {', '.join(saved_files)}")
+            return True
     except Exception as e:
         print(f"Error saving images: {e}")
-        return False
+    return False
 
 def main():
     """Main function for ZMQ receiver application."""
@@ -208,8 +227,8 @@ def main():
     # Initialize ZeroMQ context
     context = zmq.Context()
     
-    # Create queue for stereo pairs and connection status
-    stereo_pair_queue = LifoQueue(maxsize=1)
+    # Create queue for frames and connection status
+    frame_queue = LifoQueue(maxsize=10)  # Larger queue for multiple cameras
     running_flag = threading.Event()
     running_flag.set()
     
@@ -222,49 +241,55 @@ def main():
     # Start ZMQ receiver thread
     receiver_thread = threading.Thread(
         target=zmq_receive_thread, 
-        args=(context, ZMQ_CONNECT_ADDRESS, stereo_pair_queue, running_flag, connection_status)
+        args=(context, ZMQ_CONNECT_ADDRESS, frame_queue, running_flag, connection_status)
     )
     receiver_thread.daemon = True
     receiver_thread.start()
 
     # Initialize display variables
-    current_left_img_raw = None
-    current_right_img_raw = None
+    current_frames = {"left": None, "right": None, "rgb": None}
     
-    WINDOW_NAME = "Aria SLAM Stream (ZMQ - Rotated)"
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    # Setup windows
+    STEREO_WINDOW = "Aria SLAM Stream (ZMQ - Rotated)"
+    RGB_WINDOW = "Aria RGB Stream (ZMQ - Rotated)"  # Updated window title
     
-    # Set window size for rotated images
-    # Original: (480,640) -> Rotated: (640,480) -> Concatenated: 640x960
-    cv2.resizeWindow(WINDOW_NAME, 960, 640) 
-    cv2.moveWindow(WINDOW_NAME, 50, 50)
+    cv2.namedWindow(STEREO_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(STEREO_WINDOW, 960, 640)  # Concatenated stereo
+    cv2.moveWindow(STEREO_WINDOW, 50, 50)
+    
+    if ENABLE_RGB_DISPLAY:
+        cv2.namedWindow(RGB_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(RGB_WINDOW, 480, 640)  # RGB image size
+        cv2.moveWindow(RGB_WINDOW, 1050, 50)
 
-    first_pair_received = False
+    first_frame_received = {"left": False, "right": False, "rgb": False}
     connection_warning_shown = False
 
     try:
-        print("ZMQ receiver started. Press 'q' to quit, 's' to save current stereo pair.")
+        print("ZMQ receiver started. Press 'q' to quit, 's' to save current images.")
+        print("Note: RGB camera now sends grayscale images for reduced bandwidth.")
         
         while True:
-            # Try to get latest stereo pair from queue
+            # Process frames from queue
             try:
-                stereo_pair_data = stereo_pair_queue.get_nowait()
-                current_left_img_raw = stereo_pair_data["left_frame"]
-                current_right_img_raw = stereo_pair_data["right_frame"]
-                
-                if not first_pair_received:
-                    first_pair_received = True
-                    print("First stereo pair received, starting display...")
+                while True:
+                    frame_data = frame_queue.get_nowait()
+                    camera_id = frame_data["camera_id"]
+                    current_frames[camera_id] = frame_data["frame"]
                     
+                    if not first_frame_received[camera_id]:
+                        first_frame_received[camera_id] = True
+                        print(f"First {camera_id} frame received...")
+                        
             except Empty:
                 pass
 
             # Display stereo pair if available
-            if current_left_img_raw is not None and current_right_img_raw is not None:
+            if current_frames["left"] is not None and current_frames["right"] is not None:
                 try:
                     # Apply rotation to both frames for proper orientation
-                    left_rotated = np.rot90(current_left_img_raw, k=ROTATION_K)
-                    right_rotated = np.rot90(current_right_img_raw, k=ROTATION_K)
+                    left_rotated = np.rot90(current_frames["left"], k=ROTATION_K)
+                    right_rotated = np.rot90(current_frames["right"], k=ROTATION_K)
                     
                     # Concatenate frames horizontally for side-by-side display
                     stereo_display = np.hstack([left_rotated, right_rotated])
@@ -273,38 +298,73 @@ def main():
                     if not stereo_display.flags['C_CONTIGUOUS']:
                         stereo_display = np.ascontiguousarray(stereo_display)
                     
-                    cv2.imshow(WINDOW_NAME, stereo_display)
-                    
-                    # Update connection status
-                    if not connection_warning_shown:
-                        connection_warning_shown = False
+                    cv2.imshow(STEREO_WINDOW, stereo_display)
                     
                 except cv2.error as e:
-                    print(f"OpenCV error during display: {e}")
+                    print(f"OpenCV error during stereo display: {e}")
                 except Exception as e:
-                    print(f"Error during image processing: {e}")
+                    print(f"Error during stereo image processing: {e}")
             else:
-                # Show black screen when no frames available
-                waiting_img = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.imshow(WINDOW_NAME, waiting_img)
-                
-                # Print connection status to console instead
-                if not connection_status['connected'] and not connection_warning_shown:
-                    print("Waiting for connection to ZMQ sender...")
-                    connection_warning_shown = True
-                elif connection_status['connected'] and connection_warning_shown:
-                    print("Connected! Waiting for frames...")
-                    connection_warning_shown = False
+                # Show black screen when no stereo frames available
+                waiting_img = np.zeros((640, 960, 3), dtype=np.uint8)  # Rotated stereo size
+                cv2.imshow(STEREO_WINDOW, waiting_img)
+            
+            # Display RGB frame if available and enabled (now grayscale)
+            if ENABLE_RGB_DISPLAY and current_frames["rgb"] is not None:
+                try:
+                    # RGB frame is now grayscale, apply rotation
+                    rgb_rotated = np.rot90(current_frames["rgb"], k=ROTATION_K)
+                    
+                    # Handle both grayscale and potential color images
+                    if rgb_rotated.ndim == 2:
+                        # Grayscale image - display directly
+                        rgb_display = rgb_rotated
+                    elif rgb_rotated.ndim == 3 and rgb_rotated.shape[2] == 3:
+                        # Color RGB image - convert to BGR for OpenCV display
+                        rgb_display = cv2.cvtColor(rgb_rotated, cv2.COLOR_RGB2BGR)
+                    else:
+                        # Handle single channel as grayscale
+                        rgb_display = rgb_rotated.squeeze()
+                    
+                    # Ensure the array is contiguous for OpenCV display
+                    if not rgb_display.flags['C_CONTIGUOUS']:
+                        rgb_display = np.ascontiguousarray(rgb_display)
+                    
+                    cv2.imshow(RGB_WINDOW, rgb_display)
+                    
+                except cv2.error as e:
+                    print(f"OpenCV error during RGB display: {e}")
+                except Exception as e:
+                    print(f"Error during RGB image processing: {e}")
+            elif ENABLE_RGB_DISPLAY:
+                # Show black screen when no RGB frame available
+                waiting_rgb = np.zeros((512, 512), dtype=np.uint8)  # Grayscale waiting image
+                cv2.imshow(RGB_WINDOW, waiting_rgb)
+            
+            # Handle connection status
+            if not connection_status['connected'] and not connection_warning_shown:
+                print("Waiting for connection to ZMQ sender...")
+                connection_warning_shown = True
+            elif connection_status['connected'] and connection_warning_shown:
+                print("Connected! Waiting for frames...")
+                connection_warning_shown = False
 
             # Check for quit key and save key
             key = cv2.waitKey(10) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('s') and current_left_img_raw is not None and current_right_img_raw is not None:
-                # Save current stereo pair
-                left_rotated = np.rot90(current_left_img_raw, k=ROTATION_K)
-                right_rotated = np.rot90(current_right_img_raw, k=ROTATION_K)
-                save_stereo_images(left_rotated, right_rotated)
+            elif key == ord('s'):
+                # Save current images
+                left_to_save = np.rot90(current_frames["left"], k=ROTATION_K) if current_frames["left"] is not None else None
+                right_to_save = np.rot90(current_frames["right"], k=ROTATION_K) if current_frames["right"] is not None else None
+                rgb_to_save = None
+                
+                if current_frames["rgb"] is not None:
+                    rgb_rotated = np.rot90(current_frames["rgb"], k=ROTATION_K)
+                    # RGB is now grayscale, no color conversion needed
+                    rgb_to_save = rgb_rotated
+                
+                save_images(left_to_save, right_to_save, rgb_to_save)
 
     except KeyboardInterrupt:
         print("\nUser interrupted.")

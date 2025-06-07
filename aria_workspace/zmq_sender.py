@@ -20,9 +20,8 @@ import time
 import struct
 import numpy as np
 import traceback
-import signal
-import threading
 import cv2
+import threading  # Add threading import for locks
 try:
     import zmq
 except ImportError:
@@ -36,7 +35,11 @@ except ImportError:
     print("Error: Project Aria SDK not installed. Please install projectaria_client_sdk")
     sys.exit(1)
     
-from common import update_iptables, quit_keypress
+from common import update_iptables, quit_keypress, ctrl_c_handler
+from aria_utils import (
+    AriaDeviceManager, CalibrationManager, BaseAriaStreamObserver, 
+    TransmissionStatistics, setup_aria_sdk, get_camera_id_string, get_camera_id_byte
+)
 
 # Configuration
 DEVICE_IP = "192.168.3.41"
@@ -47,12 +50,23 @@ STATS_PRINT_INTERVAL_SECONDS = 5.0
 USE_UNDISTORTED_IMAGES = True  # Set to True to send undistorted images, False for raw images
 SAVE_CALIBRATION = False  # Set to True to save calibration data to file
 CALIBRATION_SAVE_PATH = "/home/developer/aria_workspace/device_calibration.json"  # Path to save calibration
+ENABLE_RGB_STREAM = True  # Set to True to enable RGB stream capture and transmission
 
-from projectaria_tools.core.calibration import (
-    device_calibration_from_json_string,
-    distort_by_calibration,
-    get_linear_camera_calibration,
-)
+# Left SLAM camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True
+LEFT_UNDISTORT_OUTPUT_WIDTH = 640    # Output width for left undistorted images
+LEFT_UNDISTORT_OUTPUT_HEIGHT = 480   # Output height for left undistorted images
+LEFT_UNDISTORT_FOCAL_LENGTH = None   # Focal length for left undistorted output (None = use original from calibration)
+
+# Right SLAM camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True
+RIGHT_UNDISTORT_OUTPUT_WIDTH = 640    # Output width for right undistorted images
+RIGHT_UNDISTORT_OUTPUT_HEIGHT = 480   # Output height for right undistorted images
+RIGHT_UNDISTORT_FOCAL_LENGTH = None   # Focal length for right undistorted output (None = use original from calibration)
+
+# RGB camera undistortion configuration - used when USE_UNDISTORTED_IMAGES is True and ENABLE_RGB_STREAM is True
+RGB_UNDISTORT_OUTPUT_WIDTH = 640     # Output width for RGB undistorted images
+RGB_UNDISTORT_OUTPUT_HEIGHT = 480    # Output height for RGB undistorted images
+RGB_UNDISTORT_FOCAL_LENGTH = None    # Focal length for RGB undistorted output (None = use original from calibration)
+
 
 class ZMQSender:
     """ZeroMQ sender for streaming SLAM image data with statistics tracking."""
@@ -88,25 +102,18 @@ class ZMQSender:
         self.bytes_sent_count = 0
         self.start_time = time.time()
         
-        # Add shutdown flag
-        self._shutdown_event = threading.Event()
-        
         print(f"ZMQ Sender initialized, bound to: {bind_address}")
         print("Waiting for subscribers to connect...")
         time.sleep(2)  # Give subscribers time to connect
 
     def send_frame(self, frame: np.ndarray, camera_id_str: str, timestamp: float):
         """Send a single frame with metadata via ZeroMQ."""
-        # Check if shutting down
-        if self._shutdown_event.is_set():
-            return
-            
         try:
             # Ensure frame is contiguous in memory for efficient serialization
             frame_contiguous = np.ascontiguousarray(frame)
             height, width = frame_contiguous.shape[:2]
             channels = frame_contiguous.shape[2] if frame_contiguous.ndim == 3 else 1
-            cam_id_byte = 1 if camera_id_str == 'left' else 2
+            cam_id_byte = get_camera_id_byte(camera_id_str)
             
             # Pack frame metadata header
             header = struct.pack('!dBHHB', timestamp, cam_id_byte, height, width, channels)
@@ -126,17 +133,12 @@ class ZMQSender:
             
         except zmq.Again:
             # Non-blocking send failed (queue full), skip this frame
-            if not self._shutdown_event.is_set():
-                print(f"Warning: ZMQ send queue full, dropping {camera_id_str} frame")
+            print(f"Warning: ZMQ send queue full, dropping {camera_id_str} frame")
         except Exception as e:
-            if not self._shutdown_event.is_set():
-                print(f"Error sending frame ({camera_id_str}): {e}")
+            print(f"Error sending frame ({camera_id_str}): {e}")
 
     def send_heartbeat(self):
         """Send periodic heartbeat message for connection monitoring."""
-        if self._shutdown_event.is_set():
-            return
-            
         try:
             heartbeat_data = struct.pack('!d', time.time())
             self.socket.send_multipart([b"heartbeat", heartbeat_data], 
@@ -144,15 +146,11 @@ class ZMQSender:
         except zmq.Again:
             pass  # Skip heartbeat if queue is full
         except Exception as e:
-            if not self._shutdown_event.is_set():
-                print(f"Error sending heartbeat: {e}")
+            print(f"Error sending heartbeat: {e}")
 
     def close(self):
         """Clean shutdown of ZMQ sender with statistics summary."""
         print("ZMQ Sender initiating shutdown...")
-        
-        # Set shutdown flag
-        self._shutdown_event.set()
         
         # Wait briefly for ongoing operations to complete
         time.sleep(0.1)
@@ -178,24 +176,10 @@ class ZMQSender:
             # Force terminate context with timeout
             if hasattr(self, 'context') and self.context:
                 print("  Terminating ZMQ context...")
-                # Terminate context in separate thread to avoid infinite waiting
-                def terminate_context():
-                    try:
-                        self.context.term()
-                        print("  Context terminated.")
-                    except Exception as e:
-                        print(f"  Warning: Error terminating context: {e}")
-                
-                terminate_thread = threading.Thread(target=terminate_context)
-                terminate_thread.daemon = True
-                terminate_thread.start()
-                terminate_thread.join(timeout=2.0)  # Wait maximum 2 seconds
-                
-                if terminate_thread.is_alive():
-                    print("  Warning: Context termination timed out, forcing exit")
-                    
+                self.context.term()
+                print("  Context terminated.")
         except Exception as e:
-            print(f"  Warning: Error during context cleanup: {e}")
+            print(f"  Warning: Error terminating context: {e}")
         
         # Clean up IPC socket file
         if self.bind_address.startswith("ipc://"):
@@ -211,298 +195,134 @@ class ZMQSender:
         print("ZMQ Sender shutdown complete.")
 
 
-class AriaStreamObserver:
-    """Observer for receiving and caching latest images from Aria SDK."""
+class AriaStreamObserver(BaseAriaStreamObserver):
+    """Observer for receiving and caching latest images from Aria SDK with ZMQ-specific functionality."""
     
-    def __init__(self, device_calibration=None, use_undistorted=False):
-        self.latest_data = {}
-        self.frames_received_count_left = 0
-        self.frames_received_count_right = 0
+    def __init__(self, calibration_manager):
+        super().__init__(calibration_manager)
         self.sent_frame_ids = {}  # Track which frames have been sent
-        
-        # Store calibration info for undistortion
-        self.device_calibration = device_calibration
-        self.use_undistorted = use_undistorted
-        self.slam_left_calib = None
-        self.slam_right_calib = None
-        self.dst_left_calib = None
-        self.dst_right_calib = None
-        
-        # Initialize calibration if undistortion is enabled
-        if self.use_undistorted and self.device_calibration:
-            try:
-                self.slam_left_calib = self.device_calibration.get_camera_calib("camera-slam-left")
-                self.slam_right_calib = self.device_calibration.get_camera_calib("camera-slam-right")
-                
-                if self.slam_left_calib:
-                    # Get focal length from original calibration
-                    original_focal_lengths = self.slam_left_calib.get_focal_lengths()
-                    # Use average of fx and fy, or just fx
-                    focal_length = float(original_focal_lengths[0])  # or np.mean(original_focal_lengths)
-                    
-                    # Create linear calibration for undistorted output using original focal length
-                    self.dst_left_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-left")
-                    print(f"Left SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
-                
-                if self.slam_right_calib:
-                    # Get focal length from original calibration
-                    original_focal_lengths = self.slam_right_calib.get_focal_lengths()
-                    focal_length = float(original_focal_lengths[0])
-                    
-                    self.dst_right_calib = get_linear_camera_calibration(640, 480, focal_length, "camera-slam-right")
-                    print(f"Right SLAM camera calibration loaded for undistortion (focal length: {focal_length:.1f})")
-                    
-            except Exception as e:
-                print(f"Warning: Could not load camera calibrations for undistortion: {e}")
-                self.use_undistorted = False
-
-    def on_image_received(self, image: np.ndarray, record: ImageDataRecord):
-        """Callback for new image data from Aria device."""
-        camera_id_str = "left" if record.camera_id == aria.CameraId.Slam1 else "right"
-        
-        # Update frame counters
-        if camera_id_str == "left":
-            self.frames_received_count_left += 1
-        else:
-            self.frames_received_count_right += 1
-        
-        # Process image (apply undistortion if enabled)
-        processed_image = image
-        if self.use_undistorted and self.device_calibration:
-            try:
-                if camera_id_str == "left" and self.slam_left_calib and self.dst_left_calib:
-                    # Apply undistortion directly to grayscale image
-                    processed_image = distort_by_calibration(image, self.dst_left_calib, self.slam_left_calib)
-                        
-                elif camera_id_str == "right" and self.slam_right_calib and self.dst_right_calib:
-                    # Apply undistortion directly to grayscale image
-                    processed_image = distort_by_calibration(image, self.dst_right_calib, self.slam_right_calib)
-                        
-            except Exception as e:
-                print(f"Warning: Undistortion failed for {camera_id_str} camera: {e}")
-                processed_image = image  # Fall back to raw image
-            
-        # Cache latest frame data with unique frame ID
+        self.data_lock = threading.Lock()  # Add lock for thread-safe data access
+    
+    def _store_frame_data(self, record, processed_image, camera_id_str):
+        """Store frame data for ZMQ transmission with unique frame tracking."""
         frame_id = f"{camera_id_str}_{record.capture_timestamp_ns}"
-        self.latest_data[record.camera_id] = {
-            "image": processed_image,
-            "timestamp": record.capture_timestamp_ns / 1e9,
-            "frame_id": frame_id,
-            "sent": False
-        }
+        with self.data_lock:  # Protect dictionary access
+            self.latest_data[record.camera_id] = {
+                "image": processed_image,
+                "timestamp": record.capture_timestamp_ns / 1e9,
+                "frame_id": frame_id,
+                "sent": False
+            }
+    
+    def get_latest_data_snapshot(self):
+        """Get a thread-safe snapshot of latest data."""
+        with self.data_lock:
+            return dict(self.latest_data)  # Create a copy
+    
+    def mark_frame_sent(self, camera_id):
+        """Thread-safely mark a frame as sent."""
+        with self.data_lock:
+            if camera_id in self.latest_data:
+                self.latest_data[camera_id]["sent"] = True
 
-
-# Add global variable to track cleanup status
-_cleanup_in_progress = False
-
-def signal_handler(signum, frame):
-    """Handle signals to ensure proper exit"""
-    global _cleanup_in_progress
-    if _cleanup_in_progress:
-        print("\nForced exit...")
-        import os
-        os._exit(1)
-    else:
-        print(f"\nReceived signal {signum}, initiating cleanup...")
-        _cleanup_in_progress = True
 
 def main():
     """Main execution function for Aria ZMQ sender."""
     
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    global _cleanup_in_progress
-    
     if UPDATE_IPTABLES_ON_LINUX and sys.platform.startswith("linux"):
         update_iptables()
     
-    # Set Aria SDK log level
-    aria.set_log_level(aria.Level.Warning)
+    setup_aria_sdk()
     
-    # Initialize components
-    device_client = aria.DeviceClient()
+    # Initialize managers
+    device_manager = AriaDeviceManager(DEVICE_IP, STREAMING_PROFILE, ENABLE_RGB_STREAM)
     sender = None
-    device = None
-    streaming_manager = None
-    recording_manager = None
-    streaming_client = None
-    device_calibration = None
+    observer = None
+    calibration_manager = None
 
     try:
-        print(f"Connecting to Aria device: {DEVICE_IP}...")
-        client_config = aria.DeviceClientConfig()
-        client_config.ip_v4_address = DEVICE_IP
-        device_client.set_client_config(client_config)
-        device = device_client.connect()
-        print("Device connected successfully.")
+        # Connect and setup device
+        device_manager.connect()
+        device_manager.stop_existing_sessions()
 
-        print("Stopping any existing sessions...")
-        streaming_manager = device.streaming_manager
-        recording_manager = device.recording_manager
-        
-        # Clean stop of existing streaming/recording
-        try:
-            streaming_manager.stop_streaming()
-            print("  Existing streaming stopped.")
-        except Exception as e:
-            print(f"  Note (stopping stream): {e}")
-            
-        try:
-            recording_manager.stop_recording()
-            print("  Existing recording stopped.")
-        except Exception as e:
-            print(f"  Note (stopping recording): {e}")
-        
-        time.sleep(3)
-        print("Pre-start cleanup finished.\n")
-
-        # Get device calibration for undistortion if needed or for saving
+        # Handle calibration
+        device_calibration = None
         if USE_UNDISTORTED_IMAGES or SAVE_CALIBRATION:
-            try:
-                print("Loading device calibration...")
-                sensors_calib_json = streaming_manager.sensors_calibration()
-                
-                # Save calibration data to file if enabled
-                if SAVE_CALIBRATION and sensors_calib_json:
-                    try:
-                        import json
-                        import os
-                        
-                        # Parse and re-format JSON for better readability
-                        calib_data = json.loads(sensors_calib_json)
-                        
-                        # Ensure directory exists
-                        os.makedirs(os.path.dirname(CALIBRATION_SAVE_PATH), exist_ok=True)
-                        
-                        # Save with pretty formatting
-                        with open(CALIBRATION_SAVE_PATH, 'w') as f:
-                            json.dump(calib_data, f, indent=2, sort_keys=True)
-                        
-                        print(f"Device calibration saved to: {CALIBRATION_SAVE_PATH}")
-                        
-                        # Also save a timestamped version
-                        timestamp = time.strftime("%Y%m%d_%H%M%S")
-                        timestamped_path = CALIBRATION_SAVE_PATH.replace('.json', f'_{timestamp}.json')
-                        with open(timestamped_path, 'w') as f:
-                            json.dump(calib_data, f, indent=2, sort_keys=True)
-                        print(f"Timestamped calibration saved to: {timestamped_path}")
-                        
-                    except Exception as e:
-                        print(f"Warning: Failed to save calibration data: {e}")
-                
-                # Parse calibration for undistortion if needed
-                if USE_UNDISTORTED_IMAGES:
-                    device_calibration = device_calibration_from_json_string(sensors_calib_json)
-                    if device_calibration:
-                        print("Device calibration loaded successfully for undistortion.")
-                    else:
-                        print("Warning: Could not parse device calibration, using raw images.")
-                        
-            except Exception as e:
-                print(f"Warning: Failed to load calibration: {e}")
-                if USE_UNDISTORTED_IMAGES:
-                    print("Using raw images due to calibration failure.")
+            device_calibration = device_manager.get_calibration(SAVE_CALIBRATION, CALIBRATION_SAVE_PATH)
+            if USE_UNDISTORTED_IMAGES and not device_calibration:
+                print("Using raw images due to calibration failure.")
 
-        # Configure and start streaming
-        streaming_client = streaming_manager.streaming_client
-        streaming_config = aria.StreamingConfig()
-        streaming_config.profile_name = STREAMING_PROFILE
-        streaming_config.security_options.use_ephemeral_certs = True
-        streaming_manager.streaming_config = streaming_config
-        streaming_manager.start_streaming()
-        print(f"Streaming started with profile: {STREAMING_PROFILE}")
-
-        # Configure streaming client for SLAM data subscription
-        sub_config = streaming_client.subscription_config
-        sub_config.subscriber_data_type = aria.StreamingDataType.Slam
-        sub_config.message_queue_size[aria.StreamingDataType.Slam] = 5
-        streaming_client.subscription_config = sub_config
-
-        # Initialize observer and ZMQ sender
-        observer = AriaStreamObserver(device_calibration, USE_UNDISTORTED_IMAGES)
+        # Initialize calibration manager and observer
+        calibration_manager = CalibrationManager(
+            device_calibration, 
+            USE_UNDISTORTED_IMAGES,
+            LEFT_UNDISTORT_OUTPUT_WIDTH, LEFT_UNDISTORT_OUTPUT_HEIGHT, LEFT_UNDISTORT_FOCAL_LENGTH,
+            RIGHT_UNDISTORT_OUTPUT_WIDTH, RIGHT_UNDISTORT_OUTPUT_HEIGHT, RIGHT_UNDISTORT_FOCAL_LENGTH,
+            RGB_UNDISTORT_OUTPUT_WIDTH, RGB_UNDISTORT_OUTPUT_HEIGHT, RGB_UNDISTORT_FOCAL_LENGTH
+        )
+        observer = AriaStreamObserver(calibration_manager)
         sender = ZMQSender(ZMQ_BIND_ADDRESS)
-        streaming_client.set_streaming_client_observer(observer)
-        streaming_client.subscribe()
+
+        # Start streaming
+        device_manager.start_streaming()
+        device_manager.streaming_client.set_streaming_client_observer(observer)
+        device_manager.streaming_client.subscribe()
         
         image_type_str = "undistorted" if USE_UNDISTORTED_IMAGES else "raw"
-        print(f"Subscribed to SLAM data stream, starting ZMQ transmission ({image_type_str} images)...")
+        stream_types = "SLAM"
+        if ENABLE_RGB_STREAM:
+            stream_types += " + RGB"
+        print(f"Subscribed to {stream_types} data stream, starting ZMQ transmission ({image_type_str} images)...")
 
-        # Statistics tracking variables
-        last_stats_print_time = time.time()
+        # Initialize statistics tracking
+        stats = TransmissionStatistics(STATS_PRINT_INTERVAL_SECONDS)
         last_heartbeat_time = time.time()
-        frames_sent_since_last_stats_left = 0
-        frames_sent_since_last_stats_right = 0
-        frames_received_since_last_stats_left = 0
-        frames_received_since_last_stats_right = 0
-        total_frames_sent_left = 0
-        total_frames_sent_right = 0
-        last_received_count_left = 0
-        last_received_count_right = 0
         
-        # Main transmission loop
-        while not quit_keypress() and not _cleanup_in_progress:
-            current_time = time.time()
-            
-            # Check if shutting down
-            if _cleanup_in_progress:
-                break
-            
-            # Send available NEW frames only
-            for camera_id, data in observer.latest_data.items():
-                if not data.get("sent", False):  # Only send if not already sent
-                    camera_id_str = "left" if camera_id == aria.CameraId.Slam1 else "right"
-                    sender.send_frame(data["image"], camera_id_str, data["timestamp"])
-                    
-                    # Mark frame as sent
-                    data["sent"] = True
-                    
-                    if camera_id_str == "left":
-                        frames_sent_since_last_stats_left += 1
-                        total_frames_sent_left += 1
-                    else:
-                        frames_sent_since_last_stats_right += 1
-                        total_frames_sent_right += 1
-            
-            # Send periodic heartbeat
-            if current_time - last_heartbeat_time > 1.0:
-                sender.send_heartbeat()
-                last_heartbeat_time = current_time
-            
-            # Print statistics periodically
-            if current_time - last_stats_print_time > STATS_PRINT_INTERVAL_SECONDS:
-                time_diff = current_time - last_stats_print_time
+        # Use ctrl_c_handler from common module - unified signal handling
+        with ctrl_c_handler() as ctrl_c:
+            while not (quit_keypress() or ctrl_c):
+                current_time = time.time()
                 
-                # Calculate rates
-                received_left_fps = (observer.frames_received_count_left - last_received_count_left) / time_diff
-                received_right_fps = (observer.frames_received_count_right - last_received_count_right) / time_diff
-                sent_left_fps = frames_sent_since_last_stats_left / time_diff
-                sent_right_fps = frames_sent_since_last_stats_right / time_diff
+                # Get thread-safe snapshot of data to avoid dictionary changed during iteration
+                data_snapshot = observer.get_latest_data_snapshot()
                 
-                timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
-                print(f"[{timestamp}] Received: L={received_left_fps:.1f} R={received_right_fps:.1f} FPS | "
-                      f"Sent: L={sent_left_fps:.1f} R={sent_right_fps:.1f} FPS | "
-                      f"Total sent: L={total_frames_sent_left} R={total_frames_sent_right}")
+                # Send available NEW frames only
+                for camera_id, data in data_snapshot.items():
+                    if not data.get("sent", False):  # Only send if not already sent
+                        # Use the corrected camera ID mapping
+                        if camera_id == aria.CameraId.Slam1:
+                            camera_id_str = "left"
+                        elif camera_id == aria.CameraId.Slam2:
+                            camera_id_str = "right"
+                        elif camera_id == aria.CameraId.Rgb:
+                            camera_id_str = "rgb"
+                        else:
+                            continue  # Skip unknown camera types
+                        
+                        sender.send_frame(data["image"], camera_id_str, data["timestamp"])
+                        
+                        # Mark frame as sent using thread-safe method
+                        observer.mark_frame_sent(camera_id)
+                        stats.update_sent_count(camera_id_str)
                 
-                # Reset counters
-                frames_sent_since_last_stats_left = 0
-                frames_sent_since_last_stats_right = 0
-                last_received_count_left = observer.frames_received_count_left
-                last_received_count_right = observer.frames_received_count_right
-                last_stats_print_time = current_time
-            
-            time.sleep(0.01)  # Small delay to prevent excessive CPU usage
+                # Send periodic heartbeat
+                if current_time - last_heartbeat_time > 1.0:
+                    sender.send_heartbeat()
+                    last_heartbeat_time = current_time
+                
+                # Print statistics periodically
+                if stats.should_print_stats():
+                    stats.print_stats(observer)
+                
+                time.sleep(0.01)  # Small delay to prevent excessive CPU usage
 
     except KeyboardInterrupt:
         print("\nUser interrupted (Ctrl+C).")
-        _cleanup_in_progress = True
     except Exception as e:
         print(f"Error occurred: {e}")
+        import traceback
         traceback.print_exc()
-        _cleanup_in_progress = True
     finally:
-        _cleanup_in_progress = True
         print("=" * 50)
         print("Shutting down, cleaning up resources...")
         
@@ -515,27 +335,11 @@ def main():
         else:
             print("ZMQ sender was not initialized.")
 
-        # Clean shutdown of Aria device
-        if device is not None:
-            try:
-                if streaming_manager:
-                    streaming_manager.stop_streaming()
-                if recording_manager:
-                    recording_manager.stop_recording()
-                device_client.disconnect(device)
-                print("Aria device disconnected.")
-            except Exception as e:
-                print(f"Error during device cleanup: {e}")
-        else:
-            print("Aria device was not connected.")
+        device_manager.cleanup()
         
         time.sleep(0.5)
         print("Cleanup complete.")
         print("=" * 50)
-        
-        # Ensure process can exit
-        import os
-        os._exit(0)
 
 if __name__ == "__main__":
     main()

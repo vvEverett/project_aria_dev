@@ -31,6 +31,13 @@ DeviceCalibration(
 - `get_aria_et_camera_calib()`: 获取Aria眼动追踪相机标定（返回左右眼数组）
 - `get_aria_microphone_calib()`: 获取Aria麦克风标定（返回7个麦克风数组）
 
+**常用相机标签：**
+- `"camera-slam-left"`: 左侧SLAM相机（灰度，640x480）
+- `"camera-slam-right"`: 右侧SLAM相机（灰度，640x480）  
+- `"camera-rgb"`: RGB相机（彩色，2880x2880或1408x1408）
+- `"camera-et-left"`: 左眼追踪相机（灰度，320x240）
+- `"camera-et-right"`: 右眼追踪相机（灰度，320x240）
+
 ### 2. 相机标定类 (CameraCalibration)
 
 相机标定类提供完整的相机内参、外参和投影功能。
@@ -55,6 +62,13 @@ CameraCalibration(
 - `SPHERICAL`: 球面投影模型  
 - `KANNALA_BRANDT_K3`: Kannala-Brandt K3模型（球面+多项式径向畸变）
 - `FISHEYE624`: 鱼眼模型（球面+径向+切向畸变）
+- `FISHEYE_RAD_TAN_THIN_PRISM`: 鱼眼径向切向薄棱镜模型（用于RGB相机）
+
+**RGB相机特点：**
+- 通常使用 `FISHEYE_RAD_TAN_THIN_PRISM` 投影模型
+- 分辨率较高（如2880x2880）
+- 具有显著的鱼眼畸变，需要去畸变处理
+- 焦距通常在600-700像素范围内
 
 **主要方法：**
 - `project(point_in_camera)`: 3D点投影到2D像素（含有效性检查）

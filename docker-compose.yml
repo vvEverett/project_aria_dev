@@ -1,5 +1,3 @@
-version: '3.3'
-
 services:
   aria-dev:
     build: .
@@ -15,11 +13,26 @@ services:
       - /tmp:/tmp
       # Hardware access
       - /dev/bus/usb:/dev/bus/usb
+      # X11 socket for display
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # X11 authentication
+      - ${HOME}/.Xauthority:/home/developer/.Xauthority:rw
+      # Additional X11 support
+      - /dev/shm:/dev/shm
       # Persistent data
       - aria_venv:/home/developer/venv
       - aria_config:/home/developer/.projectaria
     environment:
       - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/home/developer/.Xauthority
+      - QT_X11_NO_MITSHM=1
+      - QT_QPA_PLATFORM=xcb
+      - LIBGL_ALWAYS_INDIRECT=1
+      - XDG_RUNTIME_DIR=/tmp
+      - PYTHONPATH=/usr/lib/python3/dist-packages:${PYTHONPATH}
+      - LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+      - QT_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/qt5/plugins
+      - QTWEBENGINE_DISABLE_SANDBOX=1
     stdin_open: true
     tty: true
     working_dir: /home/developer/aria_workspace

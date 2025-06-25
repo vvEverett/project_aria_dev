@@ -44,7 +44,7 @@ class Config:
     stats_interval: float = 5.0
     
     # Display settings
-    enable_cv_display: bool = True  # Control OpenCV window display
+    enable_cv_display: bool = False  # Control OpenCV window display
     window_name: str = "Aria SLAM Stream (ZMQ-ROS)"
     window_width: int = 960
     window_height: int = 640
@@ -55,8 +55,11 @@ class Config:
     ros_queue_size: int = 10
     left_topic: str = "/aria/left/image_raw"
     right_topic: str = "/aria/right/image_raw"
+    rgb_topic: str = "/aria/rgb/image_raw"
+    rgb_gray_topic: str = "/aria/rgb/image_gray"
     left_frame_id: str = "aria_left"
     right_frame_id: str = "aria_right"
+    rgb_frame_id: str = "aria_rgb"
 
 class FrameData:
     """Efficient frame data container."""
@@ -74,6 +77,7 @@ class AriaZMQReceiver:
         self.config = config
         self.context = zmq.Context()
         self.stereo_queue = LifoQueue(maxsize=config.queue_maxsize)
+        self.rgb_queue = LifoQueue(maxsize=config.queue_maxsize)  # Separate RGB queue
         self.running = threading.Event()
         self.connection_status = {'connected': False, 'last_heartbeat': 0, 'last_frame': 0}
         
@@ -81,11 +85,15 @@ class AriaZMQReceiver:
         self.bridge = CvBridge()
         self.left_pub = rospy.Publisher(config.left_topic, Image, queue_size=config.ros_queue_size)
         self.right_pub = rospy.Publisher(config.right_topic, Image, queue_size=config.ros_queue_size)
+        self.rgb_pub = rospy.Publisher(config.rgb_topic, Image, queue_size=config.ros_queue_size)
+        self.rgb_gray_pub = rospy.Publisher(config.rgb_gray_topic, Image, queue_size=config.ros_queue_size)
         
         # State tracking
         self.first_pair_received = False
+        self.first_rgb_received = False
         self.connection_warning_shown = False
         self.current_frames = {'left': None, 'right': None, 'left_ts': 0, 'right_ts': 0}
+        self.current_rgb = {'frame': None, 'timestamp': 0}
         
         # Pre-allocate commonly used objects
         self.header_format = '!dBHHB'
@@ -113,7 +121,16 @@ class AriaZMQReceiver:
             # Efficient frame reconstruction
             shape = (height, width, channels) if channels > 1 else (height, width)
             frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(shape)
-            camera_id = "left" if cam_id_byte == 1 else "right"
+            
+            # Updated camera ID mapping to handle RGB
+            if cam_id_byte == 1:
+                camera_id = "left"
+            elif cam_id_byte == 2:
+                camera_id = "right"
+            elif cam_id_byte == 3:
+                camera_id = "rgb"
+            else:
+                camera_id = f"unknown_{cam_id_byte}"
             
             return FrameData(camera_id, frame, timestamp)
             
@@ -127,19 +144,20 @@ class AriaZMQReceiver:
         socket = self.context.socket(zmq.SUB)
         socket.connect(self.config.zmq_connect_address)
         
-        # Subscribe to topics
-        for topic in [b"slam.left", b"slam.right", b"heartbeat"]:
+        # Subscribe to topics including RGB
+        for topic in [b"slam.left", b"slam.right", b"slam.rgb", b"heartbeat"]:
             socket.setsockopt(zmq.SUBSCRIBE, topic)
         
         socket.setsockopt(zmq.RCVTIMEO, self.config.zmq_recv_timeout)
         
         print(f"ZMQ receiver connected to: {self.config.zmq_connect_address}")
+        print("Subscribed to: slam.left, slam.right, slam.rgb, heartbeat")
         
         # Efficient state tracking
         temp_buffer = {}
-        frame_counts = {"left": 0, "right": 0}
+        frame_counts = {"left": 0, "right": 0, "rgb": 0}
         last_stats_time = time.time()
-        last_frame_counts = {"left": 0, "right": 0}
+        last_frame_counts = {"left": 0, "right": 0, "rgb": 0}
         last_heartbeat_time = time.time()
         
         self.running.set()
@@ -163,22 +181,39 @@ class AriaZMQReceiver:
                     if frame_data:
                         camera_id = frame_data.id
                         frame_counts[camera_id] += 1
-                        temp_buffer[camera_id] = frame_data
                         
                         self.connection_status.update({
                             'last_frame': current_time,
                             'connected': True
                         })
                         
+                        # Handle RGB separately from stereo
+                        if camera_id == "rgb":
+                            rgb_data = {
+                                "frame": frame_data.frame,
+                                "timestamp": frame_data.timestamp
+                            }
+                            try:
+                                self.rgb_queue.put_nowait(rgb_data)
+                            except:
+                                try:
+                                    self.rgb_queue.get_nowait()
+                                    self.rgb_queue.put_nowait(rgb_data)
+                                except:
+                                    pass
+                        else:
+                            # Handle stereo cameras
+                            temp_buffer[camera_id] = frame_data
+                        
                         # Stats reporting
                         if current_time - last_stats_time > self.config.stats_interval:
-                            self._print_stats(frame_counts, last_frame_counts, 
-                                            current_time - last_stats_time, current_time)
+                            self._print_rgb_stats(frame_counts, last_frame_counts, 
+                                                current_time - last_stats_time, current_time)
                             last_frame_counts = frame_counts.copy()
                             last_stats_time = current_time
                         
-                        # Stereo pair assembly
-                        if len(temp_buffer) == 2:  # Both left and right available
+                        # Stereo pair assembly (only for left/right)
+                        if len(temp_buffer) == 2 and "left" in temp_buffer and "right" in temp_buffer:
                             stereo_data = {
                                 "left_frame": temp_buffer["left"].frame,
                                 "right_frame": temp_buffer["right"].frame,
@@ -186,7 +221,6 @@ class AriaZMQReceiver:
                                 "right_timestamp": temp_buffer["right"].timestamp
                             }
                             
-                            # Non-blocking queue operation
                             try:
                                 self.stereo_queue.put_nowait(stereo_data)
                             except:
@@ -229,6 +263,17 @@ class AriaZMQReceiver:
         print(f"[{timestamp}] FPS: L={left_fps:.1f}, R={right_fps:.1f} | "
               f"Total: L={frame_counts['left']}, R={frame_counts['right']}")
     
+    def _print_rgb_stats(self, frame_counts: Dict[str, int], last_counts: Dict[str, int], 
+                        time_diff: float, current_time: float):
+        """Print performance statistics including RGB."""
+        left_fps = (frame_counts["left"] - last_counts["left"]) / time_diff
+        right_fps = (frame_counts["right"] - last_counts["right"]) / time_diff
+        rgb_fps = (frame_counts["rgb"] - last_counts["rgb"]) / time_diff
+        timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
+        
+        print(f"[{timestamp}] FPS: L={left_fps:.1f}, R={right_fps:.1f}, RGB={rgb_fps:.1f} | "
+              f"Total: L={frame_counts['left']}, R={frame_counts['right']}, RGB={frame_counts['rgb']}")
+    
     def publish_to_ros(self, left_frame: np.ndarray, right_frame: np.ndarray, 
                       left_ts: float, right_ts: float):
         """Efficient ROS publishing."""
@@ -256,6 +301,57 @@ class AriaZMQReceiver:
             
         except Exception as e:
             print(f"ROS publishing error: {e}")
+    
+    def _process_rgb_frame(self):
+        """Process and publish RGB frame."""
+        try:
+            # Apply rotation
+            rgb_rotated = np.rot90(self.current_rgb['frame'], k=self.config.rotation_k)
+            
+            # Publish to ROS (both original and grayscale)
+            self.publish_rgb_to_ros(rgb_rotated, self.current_rgb['timestamp'])
+            
+        except Exception as e:
+            print(f"Error processing RGB frame: {e}")
+
+    def publish_rgb_to_ros(self, rgb_frame: np.ndarray, timestamp: float):
+        """Efficient RGB publishing - both original and grayscale."""
+        try:
+            ros_time = rospy.Time.from_sec(timestamp)
+            
+            # Determine if input is grayscale or color
+            if rgb_frame.ndim == 2 or (rgb_frame.ndim == 3 and rgb_frame.shape[2] == 1):
+                # Input is grayscale - publish as mono8 for gray topic
+                gray_msg = self.bridge.cv2_to_imgmsg(rgb_frame.squeeze(), encoding="mono8")
+                gray_msg.header.stamp = ros_time
+                gray_msg.header.frame_id = self.config.rgb_frame_id
+                self.rgb_gray_pub.publish(gray_msg)
+                
+                # For RGB topic, convert grayscale to BGR for consistency
+                if rgb_frame.ndim == 2:
+                    rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    rgb_bgr = cv2.cvtColor(rgb_frame.squeeze(), cv2.COLOR_GRAY2BGR)
+                    
+                rgb_msg = self.bridge.cv2_to_imgmsg(rgb_bgr, encoding="bgr8")
+                
+            else:
+                # Input is color - publish original as RGB and convert to grayscale
+                rgb_msg = self.bridge.cv2_to_imgmsg(rgb_frame, encoding="bgr8")
+                
+                # Convert to grayscale for gray topic
+                gray_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
+                gray_msg = self.bridge.cv2_to_imgmsg(gray_frame, encoding="mono8")
+                gray_msg.header.stamp = ros_time
+                gray_msg.header.frame_id = self.config.rgb_frame_id
+                self.rgb_gray_pub.publish(gray_msg)
+            
+            rgb_msg.header.stamp = ros_time
+            rgb_msg.header.frame_id = self.config.rgb_frame_id
+            self.rgb_pub.publish(rgb_msg)
+            
+        except Exception as e:
+            print(f"RGB ROS publishing error: {e}")
     
     def run(self):
         """Main execution loop."""
@@ -292,11 +388,30 @@ class AriaZMQReceiver:
                 except Empty:
                     pass
                 
+                # Get latest RGB frame
+                try:
+                    rgb_data = self.rgb_queue.get_nowait()
+                    self.current_rgb.update({
+                        'frame': rgb_data["frame"],
+                        'timestamp': rgb_data["timestamp"]
+                    })
+                    
+                    if not self.first_rgb_received:
+                        self.first_rgb_received = True
+                        print("First RGB frame received, starting RGB publishing...")
+                        
+                except Empty:
+                    pass
+                
                 # Process frames
                 if self.current_frames['left'] is not None and self.current_frames['right'] is not None:
                     self._process_stereo_pair()
                 else:
                     self._handle_no_frames()
+                
+                # Process RGB frame
+                if self.current_rgb['frame'] is not None:
+                    self._process_rgb_frame()
                 
                 # Check for quit (only if display is enabled)
                 if self.config.enable_cv_display:

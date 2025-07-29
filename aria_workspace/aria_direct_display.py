@@ -63,9 +63,9 @@ RIGHT_OUTPUT_WIDTH = 640
 RIGHT_OUTPUT_HEIGHT = 480
 RIGHT_FOCAL_LENGTH = None
 
-RGB_OUTPUT_WIDTH = 512
+RGB_OUTPUT_WIDTH = 512 # Default RGB camera resolution is 1408*1408, but we use 512x512
 RGB_OUTPUT_HEIGHT = 512
-RGB_FOCAL_LENGTH = 200
+RGB_FOCAL_LENGTH = 222.3 # Focal length for 512x512 RGB camera, default is 611
 # =============================================================
 
 class AriaUSBDeviceManager(AriaDeviceManager):
@@ -364,14 +364,14 @@ class AriaDisplayManager:
                         else:
                             # Grayscale or single channel
                             save_frame = rotated_frame
-                        filepath = os.path.join(folders["rgb"], f"{timestamp}.png")
+                        filepath = os.path.join(folders["rgb"], f"RGB_{timestamp}.png")
                     else:
                         # SLAM cameras (left/right) - save as-is
                         save_frame = rotated_frame
                         if camera_id == "left":
-                            filepath = os.path.join(folders["slam_left"], f"{timestamp}.png")
+                            filepath = os.path.join(folders["slam_left"], f"LEFT_{timestamp}.png")
                         else:  # right
-                            filepath = os.path.join(folders["slam_right"], f"{timestamp}.png")
+                            filepath = os.path.join(folders["slam_right"], f"RIGHT_{timestamp}.png")
                     
                     cv2.imwrite(filepath, save_frame)
                     saved_files.append(filepath)

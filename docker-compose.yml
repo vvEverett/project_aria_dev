@@ -46,6 +46,51 @@ services:
     tty: true
     working_dir: /home/developer/aria_workspace
 
+  photoslam:
+    build:
+      context: .
+      dockerfile: Dockerfile_photoslam
+    container_name: photoslam-development
+    
+    # Hardware access permissions
+    privileged: true
+    network_mode: host
+    ipc: host
+    
+    # GPU and resource configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    
+    volumes:
+      # Data volume
+      - /media/vv/data:/media/vv/data
+      
+      # Hardware device access
+      - /dev/bus/usb:/dev/bus/usb
+      
+      # X11 display forwarding
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${HOME}/.Xauthority:/root/.Xauthority
+    
+    environment:
+      # X11 display
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/root/.Xauthority
+      - QT_X11_NO_MITSHM=1
+      
+      # CUDA environment
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    
+    stdin_open: true
+    tty: true
+    working_dir: /Photo-SLAM
+
 # Named volumes for persistent data
 volumes:
   aria_venv:

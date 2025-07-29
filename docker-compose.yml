@@ -90,6 +90,13 @@ services:
     stdin_open: true
     tty: true
     working_dir: /Photo-SLAM
+    command: >
+      bash -c "
+      cd /Photo-SLAM &&
+      chmod +x ./build.sh &&
+      ./build.sh &&
+      tail -f /dev/null
+      "
 
 # Named volumes for persistent data
 volumes:

@@ -41,7 +41,7 @@ except ImportError:
     sys.exit(1)
 
 from aria_utils import (
-    AriaDeviceManager, CalibrationManager, BaseAriaStreamObserver, 
+    AriaDeviceManager, AriaUSBDeviceManager, CalibrationManager, BaseAriaStreamObserver, 
     setup_aria_sdk
 )
 
@@ -67,69 +67,6 @@ RGB_OUTPUT_WIDTH = 512 # Default RGB camera resolution is 1408*1408, but we use 
 RGB_OUTPUT_HEIGHT = 512
 RGB_FOCAL_LENGTH = 222.3 # Focal length for 512x512 RGB camera, default is 611
 # =============================================================
-
-class AriaUSBDeviceManager(AriaDeviceManager):
-    """USB-specific device manager extending AriaDeviceManager."""
-    
-    def __init__(self, streaming_profile, enable_rgb_stream=False):
-        # Initialize base class with dummy IP for USB connection
-        super().__init__(None, streaming_profile, enable_rgb_stream)
-        
-    def connect(self):
-        """Connect to Aria device via USB and initialize managers."""
-        print("Connecting to Aria device via USB...")
-        
-        # Direct USB connection without IP configuration
-        self.device = self.device_client.connect()
-        print("Device connected successfully via USB.")
-        
-        # Print device information
-        info = self.device.info
-        status = self.device.status
-        print(f"Device info - Model: {info.model}, Serial: {info.serial}")
-        print(f"Device status - Battery: {status.battery_level}%, Mode: {status.device_mode}")
-        
-        self.streaming_manager = self.device.streaming_manager
-        self.recording_manager = self.device.recording_manager
-    
-    def start_streaming(self):
-        """Configure and start USB streaming with SLAM data subscription and optional RGB."""
-        self.streaming_client = self.streaming_manager.streaming_client
-        
-        # Configure for USB streaming (key difference from base class)
-        streaming_config = aria.StreamingConfig()
-        streaming_config.profile_name = self.streaming_profile
-        streaming_config.streaming_interface = aria.StreamingInterface.Usb
-        streaming_config.security_options.use_ephemeral_certs = True
-        self.streaming_manager.streaming_config = streaming_config
-        
-        try:
-            self.streaming_manager.start_streaming()
-            print(f"USB streaming started with profile: {self.streaming_profile}")
-            
-            # Wait and check state
-            time.sleep(2)
-            state = self.streaming_manager.streaming_state
-            print(f"Current streaming state: {state}")
-            
-        except Exception as e:
-            print(f"Error starting USB streaming: {e}")
-            print("Note: If you get an active session error, please press the capture button on your Aria device to stop any active sessions, then restart this script.")
-            raise
-
-        # Configure streaming client for SLAM data subscription
-        sub_config = self.streaming_client.subscription_config
-        sub_config.subscriber_data_type = aria.StreamingDataType.Slam
-        sub_config.message_queue_size[aria.StreamingDataType.Slam] = 5
-        
-        # Add RGB stream if enabled
-        if self.enable_rgb_stream:
-            sub_config.subscriber_data_type = sub_config.subscriber_data_type | aria.StreamingDataType.Rgb
-            sub_config.message_queue_size[aria.StreamingDataType.Rgb] = 5
-            print("RGB stream enabled")
-        
-        self.streaming_client.subscription_config = sub_config
-
 
 class AriaStreamingObserver(BaseAriaStreamObserver):
     """Observer for receiving frames from Aria SDK and queuing them for display."""

@@ -57,13 +57,13 @@ except ImportError:
 
 # Import from aria_direct_display and aria_utils
 from aria_direct_display import (
-    AriaUSBDeviceManager, AriaStreamingObserver, AriaDisplayManager,
+    AriaStreamingObserver, AriaDisplayManager,
     device_streaming_thread, STREAMING_PROFILE, ENABLE_RGB_STREAM, 
     ENABLE_UNDISTORTION, ROTATION_K, LEFT_OUTPUT_WIDTH, LEFT_OUTPUT_HEIGHT, 
     LEFT_FOCAL_LENGTH, RIGHT_OUTPUT_WIDTH, RIGHT_OUTPUT_HEIGHT, RIGHT_FOCAL_LENGTH,
     RGB_OUTPUT_WIDTH, RGB_OUTPUT_HEIGHT, RGB_FOCAL_LENGTH
 )
-from aria_utils import CalibrationManager, setup_aria_sdk
+from aria_utils import AriaUSBDeviceManager, CalibrationManager, setup_aria_sdk
 
 # ======================= Configuration =======================
 # ROS 2 QoS Profile for high-performance image transport
@@ -73,9 +73,6 @@ IMAGE_QOS = QoSProfile(
     depth=10,
     durability=DurabilityPolicy.VOLATILE
 )
-
-# Frame rate limiting (set to 0 for no limit)
-MAX_PUBLISH_FPS = 0.0  # Remove FPS limit to test maximum throughput
 # =============================================================
 
 
@@ -165,10 +162,6 @@ class AriaROS2Publisher(Node):
         self.calibration_manager = calibration_manager
         self.cv_bridge = CvBridge()
         
-        # Frame rate limiting
-        self.last_publish_time = {"left": 0, "right": 0, "rgb": 0}
-        self.min_publish_interval = 1.0 / MAX_PUBLISH_FPS if MAX_PUBLISH_FPS > 0 else 0
-        
         # Create publishers for all camera streams (raw and undistorted)
         self.image_publishers = {
             "slam_left_raw": self.create_publisher(Image, '/aria/slam_left/raw', IMAGE_QOS),
@@ -188,7 +181,7 @@ class AriaROS2Publisher(Node):
         self.last_stats_time = time.time()
         
         self.get_logger().info("Aria ROS 2 Publisher initialized")
-        self.get_logger().info(f"Publishing with SHM transport, max FPS: {MAX_PUBLISH_FPS if MAX_PUBLISH_FPS > 0 else 'unlimited'}")
+        self.get_logger().info("Publishing with SHM transport")
     
     def publish_frame(self, frame_data):
         """Publish both raw and processed versions of a frame."""
@@ -196,12 +189,6 @@ class AriaROS2Publisher(Node):
         raw_frame = frame_data["raw_frame"]
         processed_frame = frame_data["frame"]
         timestamp_ns = frame_data["timestamp_ns"]
-        
-        # Frame rate limiting
-        current_time = time.time()
-        if current_time - self.last_publish_time[camera_id] < self.min_publish_interval:
-            return
-        self.last_publish_time[camera_id] = current_time
         
         try:
             # Create ROS header with proper timestamp

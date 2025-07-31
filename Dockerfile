@@ -106,17 +106,5 @@ WORKDIR /home/developer/aria_workspace
 # Expose common ports used for Aria streaming and ROS2 communication.
 EXPOSE 7000-8000 11311
 
-# --- Startup Script ---
-# Create an entrypoint script that properly sources all environments
-RUN echo '#!/bin/bash\n\
-source /opt/ros/humble/setup.bash\n\
-source /home/developer/venv/bin/activate\n\
-if [ -f /home/developer/aria_ros_ws/install/setup.bash ]; then\n\
-    source /home/developer/aria_ros_ws/install/setup.bash\n\
-fi\n\
-exec "$@"' > /home/developer/entrypoint.sh && \
-    chmod +x /home/developer/entrypoint.sh
-
-# Set the entrypoint and default command
-ENTRYPOINT ["/home/developer/entrypoint.sh"]
+# Default command - the environment is already configured in .bashrc
 CMD ["/bin/bash"]

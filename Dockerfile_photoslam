@@ -79,6 +79,38 @@ RUN cd / && \
 ENV Torch_DIR /libtorch/share/cmake/Torch
 
 # repo
-RUN git clone https://github.com/vvEverett/Photo-SLAM /Photo-SLAM
-
+RUN git clone https://github.com/vvEverett/Photo-SLAM.git
 WORKDIR /Photo-SLAM
+
+# Build DBoW2
+RUN cd /Photo-SLAM/ORB-SLAM3/Thirdparty/DBoW2 && \
+    mkdir build && \
+    cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make -j
+
+# Build g2o
+RUN cd /Photo-SLAM/ORB-SLAM3/Thirdparty/g2o && \
+    mkdir build && \
+    cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make -j
+
+# Build Sophus
+RUN cd /Photo-SLAM/ORB-SLAM3/Thirdparty/Sophus && \
+    mkdir build && \
+    cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make -j
+
+# Uncompress vocabulary
+RUN cd /Photo-SLAM/ORB-SLAM3/Vocabulary && \
+    echo "Uncompress vocabulary ..." && \
+    tar -xf ORBvoc.txt.tar.gz
+
+# Build ORB-SLAM3
+RUN cd /Photo-SLAM/ORB-SLAM3 && \
+    mkdir build && \
+    cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make -j8

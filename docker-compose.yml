@@ -7,6 +7,7 @@ services:
     privileged: true
     network_mode: host
     ipc: host
+    shm_size: 2gb # Increase shared memory size for large image processing
     
     # GPU and resource configuration
     deploy:
@@ -29,8 +30,8 @@ services:
       - ${HOME}/.Xauthority:/home/developer/.Xauthority
       
       # Persistent application data
-      - aria_venv:/home/developer/venv
-      - aria_config:/home/developer/.projectaria
+      # - aria_venv:/home/developer/venv
+      # - aria_config:/home/developer/.projectaria
     
     environment:
       # X11 display
@@ -41,6 +42,10 @@ services:
       # Python environment
       - PYTHONPATH=/usr/lib/python3/dist-packages:${PYTHONPATH}
       - LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+      # ROS2 environment
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/home/developer/aria_workspace/config/fastdds_shm.xml
     
     stdin_open: true
     tty: true
@@ -68,7 +73,7 @@ services:
     
     volumes:
       # Data volume
-      - /media/vv/data:/media/vv/data
+      - /media/vv/data1:/media/vv/data
       
       # Hardware device access
       - /dev/bus/usb:/dev/bus/usb
@@ -92,13 +97,21 @@ services:
     working_dir: /Photo-SLAM
     command: >
       bash -c "
+        echo 'Starting Photo-SLAM build process...' &&
       cd /Photo-SLAM &&
-      chmod +x ./build.sh &&
-      ./build.sh &&
+        
+        # Build main Photo-SLAM project
+        echo 'Building Photo-SLAM main project...' &&
+        mkdir -p build &&
+        cd build &&
+        cmake .. -DCMAKE_BUILD_TYPE=Release &&
+        make -j8 &&
+        
+        echo 'Photo-SLAM build completed successfully!' &&
+        echo 'Container ready for development...' &&
       tail -f /dev/null
       "
 
-# Named volumes for persistent data
-volumes:
-  aria_venv:
-  aria_config:
+# volumes:
+#   aria_venv:
+#   aria_config:

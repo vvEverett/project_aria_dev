@@ -51,67 +51,7 @@ services:
     tty: true
     working_dir: /home/developer/aria_workspace
 
-  photoslam:
-    build:
-      context: .
-      dockerfile: Dockerfile_photoslam
-    container_name: photoslam-development
-    
-    # Hardware access permissions
-    privileged: true
-    network_mode: host
-    ipc: host
-    
-    # GPU and resource configuration
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
-    
-    volumes:
-      # Data volume
-      - /media/vv/data1:/media/vv/data
-      
-      # Hardware device access
-      - /dev/bus/usb:/dev/bus/usb
-      
-      # X11 display forwarding
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - ${HOME}/.Xauthority:/root/.Xauthority
-    
-    environment:
-      # X11 display
-      - DISPLAY=${DISPLAY}
-      - XAUTHORITY=/root/.Xauthority
-      - QT_X11_NO_MITSHM=1
-      
-      # CUDA environment
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
-    
-    stdin_open: true
-    tty: true
-    working_dir: /Photo-SLAM
-    command: >
-      bash -c "
-        echo 'Starting Photo-SLAM build process...' &&
-      cd /Photo-SLAM &&
-        
-        # Build main Photo-SLAM project
-        echo 'Building Photo-SLAM main project...' &&
-        mkdir -p build &&
-        cd build &&
-        cmake .. -DCMAKE_BUILD_TYPE=Release &&
-        make -j8 &&
-        
-        echo 'Photo-SLAM build completed successfully!' &&
-        echo 'Container ready for development...' &&
-      tail -f /dev/null
-      "
-
+# Named volumes for persistent data
 # volumes:
 #   aria_venv:
 #   aria_config:

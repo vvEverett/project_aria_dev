@@ -7,6 +7,7 @@ services:
     privileged: true
     network_mode: host
     ipc: host
+    # shm_size: 2gb # If use host IPC, shm_size is not needed, default is the half of the host memory
     
     # GPU and resource configuration
     deploy:
@@ -20,6 +21,9 @@ services:
     volumes:
       # Project workspace
       - ./aria_workspace:/home/developer/aria_workspace
+
+      # IPC socket directory
+      - /tmp:/tmp
       
       # Hardware device access
       - /dev/bus/usb:/dev/bus/usb
@@ -29,8 +33,8 @@ services:
       - ${HOME}/.Xauthority:/home/developer/.Xauthority
       
       # Persistent application data
-      - aria_venv:/home/developer/venv
-      - aria_config:/home/developer/.projectaria
+      # - aria_venv:/home/developer/venv
+      # - aria_config:/home/developer/.projectaria
     
     environment:
       # X11 display
@@ -41,12 +45,17 @@ services:
       # Python environment
       - PYTHONPATH=/usr/lib/python3/dist-packages:${PYTHONPATH}
       - LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+      # ROS2 environment
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/home/developer/aria_workspace/config/fastdds_shm.xml
     
     stdin_open: true
     tty: true
     working_dir: /home/developer/aria_workspace
 
 # Named volumes for persistent data
-volumes:
-  aria_venv:
-  aria_config:
+# volumes:
+#   aria_venv:
+#   aria_config:

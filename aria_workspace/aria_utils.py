@@ -7,6 +7,7 @@ Shared utilities for Aria device streaming applications including:
 - Common streaming observer base class
 - Statistics tracking helpers
 - Unified signal handling
+- Display management for OpenCV windows
 """
 
 import sys
@@ -14,6 +15,7 @@ import time
 import json
 import os
 import numpy as np
+import cv2
 import aria.sdk as aria
 from projectaria_tools.core.sensor_data import ImageDataRecord
 from projectaria_tools.core.calibration import (
@@ -169,6 +171,68 @@ class AriaDeviceManager:
         else:
             print("  Aria device was not connected.")
 
+
+class AriaUSBDeviceManager(AriaDeviceManager):
+    """USB-specific device manager extending AriaDeviceManager."""
+    
+    def __init__(self, streaming_profile, enable_rgb_stream=False):
+        # Initialize base class with dummy IP for USB connection
+        super().__init__(None, streaming_profile, enable_rgb_stream)
+        
+    def connect(self):
+        """Connect to Aria device via USB and initialize managers."""
+        print("Connecting to Aria device via USB...")
+        
+        # Direct USB connection without IP configuration
+        self.device = self.device_client.connect()
+        print("Device connected successfully via USB.")
+        
+        # Print device information
+        info = self.device.info
+        status = self.device.status
+        print(f"Device info - Model: {info.model}, Serial: {info.serial}")
+        print(f"Device status - Battery: {status.battery_level}%, Mode: {status.device_mode}")
+        
+        self.streaming_manager = self.device.streaming_manager
+        self.recording_manager = self.device.recording_manager
+    
+    def start_streaming(self):
+        """Configure and start USB streaming with SLAM data subscription and optional RGB."""
+        self.streaming_client = self.streaming_manager.streaming_client
+        
+        # Configure for USB streaming (key difference from base class)
+        streaming_config = aria.StreamingConfig()
+        streaming_config.profile_name = self.streaming_profile
+        streaming_config.streaming_interface = aria.StreamingInterface.Usb
+        streaming_config.security_options.use_ephemeral_certs = True
+        self.streaming_manager.streaming_config = streaming_config
+        
+        try:
+            self.streaming_manager.start_streaming()
+            print(f"USB streaming started with profile: {self.streaming_profile}")
+            
+            # Wait and check state
+            time.sleep(2)
+            state = self.streaming_manager.streaming_state
+            print(f"Current streaming state: {state}")
+            
+        except Exception as e:
+            print(f"Error starting USB streaming: {e}")
+            print("Note: If you get an active session error, please press the capture button on your Aria device to stop any active sessions, then restart this script.")
+            raise
+
+        # Configure streaming client for SLAM data subscription
+        sub_config = self.streaming_client.subscription_config
+        sub_config.subscriber_data_type = aria.StreamingDataType.Slam
+        sub_config.message_queue_size[aria.StreamingDataType.Slam] = 5
+        
+        # Add RGB stream if enabled
+        if self.enable_rgb_stream:
+            sub_config.subscriber_data_type = sub_config.subscriber_data_type | aria.StreamingDataType.Rgb
+            sub_config.message_queue_size[aria.StreamingDataType.Rgb] = 5
+            print("RGB stream enabled")
+        
+        self.streaming_client.subscription_config = sub_config
 
 class CalibrationManager:
     """Manages camera calibration and undistortion operations."""
@@ -412,3 +476,170 @@ def get_camera_id_byte(camera_id_str: str) -> int:
         return 3
     else:
         return 0
+
+
+class AriaDisplayManager:
+    """Manages OpenCV display windows and frame visualization."""
+    
+    def __init__(self, display_scale=1.0, save_base_dir="/home/developer/aria_workspace", 
+                 rotation_k=-1, enable_rgb_stream=True, enable_undistortion=True):
+        self.display_scale = display_scale
+        self.save_base_dir = save_base_dir
+        self.rotation_k = rotation_k
+        self.enable_rgb_stream = enable_rgb_stream
+        self.undistortion_enabled = enable_undistortion
+        
+        # Window names
+        self.stereo_window = "Aria SLAM Stereo Stream (Direct)"
+        self.rgb_window = "Aria RGB Stream (Direct)"
+        
+        self._setup_windows()
+        
+    def _setup_windows(self):
+        """Setup OpenCV display windows."""
+        # Stereo display window
+        cv2.namedWindow(self.stereo_window, cv2.WINDOW_NORMAL)
+        stereo_width = int(960 * self.display_scale)
+        stereo_height = int(640 * self.display_scale)
+        cv2.resizeWindow(self.stereo_window, stereo_width, stereo_height)
+        cv2.moveWindow(self.stereo_window, 50, 50)
+        
+        # RGB display window
+        if self.enable_rgb_stream:
+            cv2.namedWindow(self.rgb_window, cv2.WINDOW_NORMAL)
+            rgb_width = int(512 * self.display_scale)
+            rgb_height = int(512 * self.display_scale)
+            cv2.resizeWindow(self.rgb_window, rgb_width, rgb_height)
+            cv2.moveWindow(self.rgb_window, 1050, 50)
+    
+    def display_frames(self, frames):
+        """Display current frames."""
+        self._display_stereo(frames["left"], frames["right"])
+        if self.enable_rgb_stream:
+            self._display_rgb(frames["rgb"])
+    
+    def _display_stereo(self, left_frame, right_frame):
+        """Display stereo pair (left and right cameras)."""
+        if left_frame is not None and right_frame is not None:
+            try:
+                # Apply rotation for proper orientation
+                left_rotated = np.rot90(left_frame, k=self.rotation_k)
+                right_rotated = np.rot90(right_frame, k=self.rotation_k)
+                
+                # Concatenate frames horizontally
+                stereo_display = np.hstack([left_rotated, right_rotated])
+                
+                # Ensure contiguous array for OpenCV
+                if not stereo_display.flags['C_CONTIGUOUS']:
+                    stereo_display = np.ascontiguousarray(stereo_display)
+                
+                # Add status text
+                status_text = f"Undistortion: {'ON' if self.undistortion_enabled else 'OFF'}"
+                cv2.putText(stereo_display, status_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
+                
+                cv2.imshow(self.stereo_window, stereo_display)
+                
+            except Exception as e:
+                print(f"Error displaying stereo frames: {e}")
+        else:
+            # Show waiting screen
+            waiting_img = np.zeros((640, 960), dtype=np.uint8)
+            cv2.putText(waiting_img, "Waiting for stereo frames...", (300, 320), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, 128, 2)
+            cv2.imshow(self.stereo_window, waiting_img)
+    
+    def _display_rgb(self, rgb_frame):
+        """Display RGB camera frame."""
+        if rgb_frame is not None:
+            try:
+                # Apply rotation for proper orientation
+                rgb_rotated = np.rot90(rgb_frame, k=self.rotation_k)
+                
+                # Handle different image formats
+                if rgb_rotated.ndim == 2:
+                    # Grayscale image
+                    rgb_display = rgb_rotated
+                elif rgb_rotated.ndim == 3 and rgb_rotated.shape[2] == 3:
+                    # Color RGB image - convert to BGR for OpenCV
+                    rgb_display = cv2.cvtColor(rgb_rotated, cv2.COLOR_RGB2BGR)
+                else:
+                    # Handle single channel as grayscale
+                    rgb_display = rgb_rotated.squeeze()
+                
+                # Ensure contiguous array for OpenCV
+                if not rgb_display.flags['C_CONTIGUOUS']:
+                    rgb_display = np.ascontiguousarray(rgb_display)
+                
+                cv2.imshow(self.rgb_window, rgb_display)
+                
+            except Exception as e:
+                print(f"Error displaying RGB frame: {e}")
+        else:
+            # Show waiting screen
+            waiting_rgb = np.zeros((512, 512), dtype=np.uint8)
+            cv2.putText(waiting_rgb, "Waiting for RGB...", (150, 256), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, 128, 2)
+            cv2.imshow(self.rgb_window, waiting_rgb)
+    
+    def save_current_frames(self, frames):
+        """Save current frames to disk."""
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            
+            # Create directory structure
+            aria_folder = os.path.join(self.save_base_dir, "Aria_images")
+            folders = {
+                "slam_left": os.path.join(aria_folder, "slam_left"),
+                "slam_right": os.path.join(aria_folder, "slam_right"),
+                "rgb": os.path.join(aria_folder, "rgb")
+            }
+            
+            for folder in folders.values():
+                os.makedirs(folder, exist_ok=True)
+            
+            saved_files = []
+            
+            # Save frames with rotation applied
+            for camera_id in ["left", "right", "rgb"]:
+                frame = frames[camera_id]
+                if frame is not None:
+                    rotated_frame = np.rot90(frame, k=self.rotation_k)
+                    
+                    # Handle RGB channel conversion for saving
+                    if camera_id == "rgb":
+                        # Convert RGB to BGR for correct color representation in saved image
+                        if rotated_frame.ndim == 3 and rotated_frame.shape[2] == 3:
+                            # Color RGB image - convert to BGR for OpenCV saving
+                            save_frame = cv2.cvtColor(rotated_frame, cv2.COLOR_RGB2BGR)
+                        else:
+                            # Grayscale or single channel
+                            save_frame = rotated_frame
+                        filepath = os.path.join(folders["rgb"], f"RGB_{timestamp}.png")
+                    else:
+                        # SLAM cameras (left/right) - save as-is
+                        save_frame = rotated_frame
+                        if camera_id == "left":
+                            filepath = os.path.join(folders["slam_left"], f"LEFT_{timestamp}.png")
+                        else:  # right
+                            filepath = os.path.join(folders["slam_right"], f"RIGHT_{timestamp}.png")
+                    
+                    cv2.imwrite(filepath, save_frame)
+                    saved_files.append(filepath)
+            
+            if saved_files:
+                print(f"Images saved: {len(saved_files)} files in {aria_folder}")
+                return True
+                
+        except Exception as e:
+            print(f"Error saving images: {e}")
+        return False
+    
+    def toggle_undistortion(self):
+        """Toggle undistortion on/off."""
+        self.undistortion_enabled = not self.undistortion_enabled
+        return self.undistortion_enabled
+    
+    def cleanup(self):
+        """Cleanup display resources."""
+        cv2.destroyAllWindows()

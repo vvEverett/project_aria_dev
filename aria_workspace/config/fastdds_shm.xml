@@ -4,10 +4,12 @@
         <transport_descriptor>
             <transport_id>shm_transport</transport_id>
             <type>SHM</type>
+            <maxMessageSize>10485760</maxMessageSize>
+            <segment_size>52428800</segment_size>
         </transport_descriptor>
     </transport_descriptors>
     
-    <participant profile_name="default_participant">
+    <participant profile_name="default_participant" is_default_profile="true">
         <rtps>
             <userTransports>
                 <transport_id>shm_transport</transport_id>

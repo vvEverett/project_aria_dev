@@ -7,7 +7,7 @@ services:
     privileged: true
     network_mode: host
     ipc: host
-    shm_size: 2gb # Increase shared memory size for large image processing
+    # shm_size: 2gb # If use host IPC, shm_size is not needed, default is the half of the host memory
     
     # GPU and resource configuration
     deploy:
@@ -21,6 +21,9 @@ services:
     volumes:
       # Project workspace
       - ./aria_workspace:/home/developer/aria_workspace
+
+      # IPC socket directory
+      - /tmp:/tmp
       
       # Hardware device access
       - /dev/bus/usb:/dev/bus/usb
@@ -44,6 +47,7 @@ services:
       - LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
       # ROS2 environment
+      - ROS_DOMAIN_ID=0
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - FASTRTPS_DEFAULT_PROFILES_FILE=/home/developer/aria_workspace/config/fastdds_shm.xml
     

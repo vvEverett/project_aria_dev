@@ -87,7 +87,7 @@ class AriaSimpleSubscriber(Node):
         
         # OpenCV window
         cv2.namedWindow('Aria Camera Feeds', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Aria Camera Feeds', 1200, 800)
+        cv2.resizeWindow('Aria Camera Feeds', 1000, 800)
         
         self.get_logger().info("Aria Subscriber initialized - All images in one window")
     
@@ -119,23 +119,14 @@ class AriaSimpleSubscriber(Node):
             ['slam_left_undistorted', 'slam_right_undistorted', 'rgb_undistorted']
         ]
         
-        # Define target heights and calculate widths based on original aspect ratios
-        target_height = 300
+        # Define target dimensions based on actual camera specifications
+        # SLAM cameras: 480x640 (3:4 aspect ratio - portrait orientation)
+        slam_target_height = 320
+        slam_target_width = int(slam_target_height * (480/640))  # 240 pixels
         
-        # SLAM cameras typically have 1:1 or similar aspect ratio
-        slam_target_width = target_height  # Maintain square aspect for SLAM
-        
-        # RGB camera typically has 4:3 or 16:9 aspect ratio
-        # We'll dynamically calculate based on first available RGB image
-        rgb_target_width = int(target_height * 4/3)  # Default 4:3, will adjust if actual image available
-        
-        # Try to get actual aspect ratio from first available RGB image
-        for rgb_key in ['rgb_raw', 'rgb_undistorted']:
-            if images.get(rgb_key) is not None:
-                rgb_img = images[rgb_key]
-                actual_aspect_ratio = rgb_img.shape[1] / rgb_img.shape[0]
-                rgb_target_width = int(target_height * actual_aspect_ratio)
-                break
+        # RGB cameras: 512x512 (1:1 aspect ratio)
+        rgb_target_height = 320
+        rgb_target_width = rgb_target_height  # 320 pixels (square)
         
         rows = []
         for row_topics in display_order:
@@ -146,47 +137,26 @@ class AriaSimpleSubscriber(Node):
                 # Determine target size based on camera type
                 if 'slam' in topic:
                     target_width = slam_target_width
+                    target_height = slam_target_height
                 else:  # RGB
                     target_width = rgb_target_width
+                    target_height = rgb_target_height
                 
                 if img is not None:
-                    # Resize image maintaining aspect ratio
-                    h, w = img.shape[:2]
-                    aspect_ratio = w / h
-                    
-                    # Calculate actual dimensions to fit within target while maintaining aspect
-                    if aspect_ratio > (target_width / target_height):
-                        # Image is wider - fit to width
-                        actual_width = target_width
-                        actual_height = int(target_width / aspect_ratio)
-                    else:
-                        # Image is taller - fit to height
-                        actual_height = target_height
-                        actual_width = int(target_height * aspect_ratio)
-                    
-                    resized = cv2.resize(img, (actual_width, actual_height))
-                    
-                    # Create a canvas with target dimensions and center the resized image
-                    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-                    y_offset = (target_height - actual_height) // 2
-                    x_offset = (target_width - actual_width) // 2
-                    canvas[y_offset:y_offset+actual_height, x_offset:x_offset+actual_width] = resized
+                    # Resize image to exact target dimensions
+                    resized = cv2.resize(img, (target_width, target_height))
                     
                     # Add topic label
-                    cv2.putText(canvas, topic, (10, 30), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(resized, topic, (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
                     # Create placeholder with appropriate size
-                    if 'slam' in topic:
-                        target_width = slam_target_width
-                    else:
-                        target_width = rgb_target_width
-                        
                     canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
                     cv2.putText(canvas, f"{topic} - No Image", (10, target_height//2), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    resized = canvas
                 
-                row_images.append(canvas)
+                row_images.append(resized)
             
             # Combine images in this row
             if row_images:
@@ -198,8 +168,9 @@ class AriaSimpleSubscriber(Node):
             return combined
         else:
             # Return placeholder if no images
-            placeholder = np.zeros((600, slam_target_width * 2 + rgb_target_width, 3), dtype=np.uint8)
-            cv2.putText(placeholder, "Waiting for images...", (400, 300), 
+            total_width = slam_target_width * 2 + rgb_target_width
+            placeholder = np.zeros((600, total_width, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "Waiting for images...", (total_width//2 - 150, 300), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             return placeholder
     

@@ -57,13 +57,15 @@ except ImportError:
 
 # Import from aria_direct_display and aria_utils
 from aria_direct_display import (
-    AriaStreamingObserver, AriaDisplayManager,
-    device_streaming_thread, STREAMING_PROFILE, ENABLE_RGB_STREAM, 
+    AriaStreamingObserver, device_streaming_thread, STREAMING_PROFILE, ENABLE_RGB_STREAM, 
     ENABLE_UNDISTORTION, ROTATION_K, LEFT_OUTPUT_WIDTH, LEFT_OUTPUT_HEIGHT, 
     LEFT_FOCAL_LENGTH, RIGHT_OUTPUT_WIDTH, RIGHT_OUTPUT_HEIGHT, RIGHT_FOCAL_LENGTH,
-    RGB_OUTPUT_WIDTH, RGB_OUTPUT_HEIGHT, RGB_FOCAL_LENGTH
+    RGB_OUTPUT_WIDTH, RGB_OUTPUT_HEIGHT, RGB_FOCAL_LENGTH, SAVE_BASE_DIR, DISPLAY_SCALE
 )
-from aria_utils import AriaUSBDeviceManager, CalibrationManager, setup_aria_sdk
+ENABLE_UNDISTORTION = True  # Set to True to apply undistortion by default
+ENABLE_DISPLAY = False  # Set to False to disable OpenCV display windows (headless mode for ROS 2 only)
+
+from aria_utils import AriaUSBDeviceManager, CalibrationManager, AriaDisplayManager, setup_aria_sdk
 
 # ======================= Configuration =======================
 # ROS 2 QoS Profile for high-performance image transport
@@ -362,7 +364,10 @@ def enhanced_device_streaming_thread(device_manager, calibration_manager,
 def main():
     """Main application entry point with ROS 2 integration."""
     print("Aria ROS 2 Publisher with Direct Display - Real-time camera stream publishing")
-    print("Controls: 'q'=quit, 's'=save images, 'u'=toggle undistortion, ESC=quit")
+    if ENABLE_DISPLAY:
+        print("Controls: 'q'=quit, 's'=save images, 'u'=toggle undistortion, ESC=quit")
+    else:
+        print("Running in headless mode (ROS 2 publishing only). Press Ctrl+C to quit.")
     
     # Initialize ROS 2
     rclpy.init()
@@ -371,7 +376,13 @@ def main():
     
     # Initialize managers
     device_manager = AriaUSBDeviceManager(STREAMING_PROFILE, ENABLE_RGB_STREAM)
-    display_manager = AriaDisplayManager()
+    display_manager = AriaDisplayManager(
+        display_scale=DISPLAY_SCALE,
+        save_base_dir=SAVE_BASE_DIR,
+        rotation_k=ROTATION_K,
+        enable_rgb_stream=ENABLE_RGB_STREAM,
+        enable_undistortion=ENABLE_UNDISTORTION
+    )
     calibration_manager = None
     streaming_thread = None
     ros2_thread = None
@@ -439,20 +450,24 @@ def main():
             except Empty:
                 pass  # No more frames in queue
             
-            # Display frames (keeps existing processing pipeline)
-            display_manager.display_frames(current_frames)
-            
-            # Handle keyboard input
-            key = cv2.waitKey(10) & 0xFF
-            if key == ord('q') or key == 27:  # 'q' or ESC
-                break
-            elif key == ord('s'):
-                display_manager.save_current_frames(current_frames)
-            elif key == ord('u'):
-                # Toggle undistortion
-                enabled = display_manager.toggle_undistortion()
-                calibration_manager.use_undistorted = enabled
-                print(f"Undistortion {'enabled' if enabled else 'disabled'}")
+            # Display frames only if display is enabled
+            if ENABLE_DISPLAY:
+                display_manager.display_frames(current_frames)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(10) & 0xFF
+                if key == ord('q') or key == 27:  # 'q' or ESC
+                    break
+                elif key == ord('s'):
+                    display_manager.save_current_frames(current_frames)
+                elif key == ord('u'):
+                    # Toggle undistortion
+                    enabled = display_manager.toggle_undistortion()
+                    calibration_manager.use_undistorted = enabled
+                    print(f"Undistortion {'enabled' if enabled else 'disabled'}")
+            else:
+                # In headless mode, just sleep to prevent busy waiting
+                time.sleep(0.1)
             
             # Spin ROS 2 node (non-blocking)
             rclpy.spin_once(ros2_publisher, timeout_sec=0)

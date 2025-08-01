@@ -42,7 +42,7 @@ except ImportError:
 
 from aria_utils import (
     AriaDeviceManager, AriaUSBDeviceManager, CalibrationManager, BaseAriaStreamObserver, 
-    setup_aria_sdk
+    AriaDisplayManager, setup_aria_sdk
 )
 
 # ======================= Configuration =======================
@@ -52,6 +52,7 @@ SAVE_BASE_DIR = "/home/developer/aria_workspace"  # Base directory for saving im
 ENABLE_RGB_STREAM = True  # Set to True to enable RGB camera stream
 ENABLE_UNDISTORTION = True  # Set to True to apply undistortion by default
 ENABLE_STATISTICS = True  # Set to True to show frame statistics
+ENABLE_DISPLAY = True  # Set to False to disable OpenCV display windows (headless mode)
 DISPLAY_SCALE = 1.0  # Scale factor for display windows (1.0 = original size)
 
 # Undistortion configuration
@@ -165,182 +166,25 @@ def device_streaming_thread(device_manager, calibration_manager, frame_queue, ru
                 print(f"Error unsubscribing in streaming thread: {e}")
 
 
-class AriaDisplayObserver:
-    """Legacy compatibility class - no longer used with threaded architecture."""
-    pass
-
-
-class AriaDisplayManager:
-    """Manages OpenCV display windows and frame visualization."""
-    
-    def __init__(self):
-        # Window names
-        self.stereo_window = "Aria SLAM Stereo Stream (Direct)"
-        self.rgb_window = "Aria RGB Stream (Direct)"
-        
-        self._setup_windows()
-        self.undistortion_enabled = ENABLE_UNDISTORTION
-        
-    def _setup_windows(self):
-        """Setup OpenCV display windows."""
-        # Stereo display window
-        cv2.namedWindow(self.stereo_window, cv2.WINDOW_NORMAL)
-        stereo_width = int(960 * DISPLAY_SCALE)
-        stereo_height = int(640 * DISPLAY_SCALE)
-        cv2.resizeWindow(self.stereo_window, stereo_width, stereo_height)
-        cv2.moveWindow(self.stereo_window, 50, 50)
-        
-        # RGB display window
-        if ENABLE_RGB_STREAM:
-            cv2.namedWindow(self.rgb_window, cv2.WINDOW_NORMAL)
-            rgb_width = int(512 * DISPLAY_SCALE)
-            rgb_height = int(512 * DISPLAY_SCALE)
-            cv2.resizeWindow(self.rgb_window, rgb_width, rgb_height)
-            cv2.moveWindow(self.rgb_window, 1050, 50)
-    
-    def display_frames(self, frames):
-        """Display current frames."""
-        self._display_stereo(frames["left"], frames["right"])
-        if ENABLE_RGB_STREAM:
-            self._display_rgb(frames["rgb"])
-    
-    def _display_stereo(self, left_frame, right_frame):
-        """Display stereo pair (left and right cameras)."""
-        if left_frame is not None and right_frame is not None:
-            try:
-                # Apply rotation for proper orientation
-                left_rotated = np.rot90(left_frame, k=ROTATION_K)
-                right_rotated = np.rot90(right_frame, k=ROTATION_K)
-                
-                # Concatenate frames horizontally
-                stereo_display = np.hstack([left_rotated, right_rotated])
-                
-                # Ensure contiguous array for OpenCV
-                if not stereo_display.flags['C_CONTIGUOUS']:
-                    stereo_display = np.ascontiguousarray(stereo_display)
-                
-                # Add status text
-                status_text = f"Undistortion: {'ON' if self.undistortion_enabled else 'OFF'}"
-                cv2.putText(stereo_display, status_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
-                
-                cv2.imshow(self.stereo_window, stereo_display)
-                
-            except Exception as e:
-                print(f"Error displaying stereo frames: {e}")
-        else:
-            # Show waiting screen
-            waiting_img = np.zeros((640, 960), dtype=np.uint8)
-            cv2.putText(waiting_img, "Waiting for stereo frames...", (300, 320), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, 128, 2)
-            cv2.imshow(self.stereo_window, waiting_img)
-    
-    def _display_rgb(self, rgb_frame):
-        """Display RGB camera frame."""
-        if rgb_frame is not None:
-            try:
-                # Apply rotation for proper orientation
-                rgb_rotated = np.rot90(rgb_frame, k=ROTATION_K)
-                
-                # Handle different image formats
-                if rgb_rotated.ndim == 2:
-                    # Grayscale image
-                    rgb_display = rgb_rotated
-                elif rgb_rotated.ndim == 3 and rgb_rotated.shape[2] == 3:
-                    # Color RGB image - convert to BGR for OpenCV
-                    rgb_display = cv2.cvtColor(rgb_rotated, cv2.COLOR_RGB2BGR)
-                else:
-                    # Handle single channel as grayscale
-                    rgb_display = rgb_rotated.squeeze()
-                
-                # Ensure contiguous array for OpenCV
-                if not rgb_display.flags['C_CONTIGUOUS']:
-                    rgb_display = np.ascontiguousarray(rgb_display)
-                
-                cv2.imshow(self.rgb_window, rgb_display)
-                
-            except Exception as e:
-                print(f"Error displaying RGB frame: {e}")
-        else:
-            # Show waiting screen
-            waiting_rgb = np.zeros((512, 512), dtype=np.uint8)
-            cv2.putText(waiting_rgb, "Waiting for RGB...", (150, 256), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, 128, 2)
-            cv2.imshow(self.rgb_window, waiting_rgb)
-    
-    def save_current_frames(self, frames):
-        """Save current frames to disk."""
-        try:
-            timestamp = time.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            
-            # Create directory structure
-            aria_folder = os.path.join(SAVE_BASE_DIR, "Aria_images")
-            folders = {
-                "slam_left": os.path.join(aria_folder, "slam_left"),
-                "slam_right": os.path.join(aria_folder, "slam_right"),
-                "rgb": os.path.join(aria_folder, "rgb")
-            }
-            
-            for folder in folders.values():
-                os.makedirs(folder, exist_ok=True)
-            
-            saved_files = []
-            
-            # Save frames with rotation applied
-            for camera_id in ["left", "right", "rgb"]:
-                frame = frames[camera_id]
-                if frame is not None:
-                    rotated_frame = np.rot90(frame, k=ROTATION_K)
-                    
-                    # Handle RGB channel conversion for saving
-                    if camera_id == "rgb":
-                        # Convert RGB to BGR for correct color representation in saved image
-                        if rotated_frame.ndim == 3 and rotated_frame.shape[2] == 3:
-                            # Color RGB image - convert to BGR for OpenCV saving
-                            save_frame = cv2.cvtColor(rotated_frame, cv2.COLOR_RGB2BGR)
-                        else:
-                            # Grayscale or single channel
-                            save_frame = rotated_frame
-                        filepath = os.path.join(folders["rgb"], f"RGB_{timestamp}.png")
-                    else:
-                        # SLAM cameras (left/right) - save as-is
-                        save_frame = rotated_frame
-                        if camera_id == "left":
-                            filepath = os.path.join(folders["slam_left"], f"LEFT_{timestamp}.png")
-                        else:  # right
-                            filepath = os.path.join(folders["slam_right"], f"RIGHT_{timestamp}.png")
-                    
-                    cv2.imwrite(filepath, save_frame)
-                    saved_files.append(filepath)
-            
-            if saved_files:
-                print(f"Images saved: {len(saved_files)} files in {aria_folder}")
-                return True
-                
-        except Exception as e:
-            print(f"Error saving images: {e}")
-        return False
-    
-    def toggle_undistortion(self):
-        """Toggle undistortion on/off."""
-        self.undistortion_enabled = not self.undistortion_enabled
-        return self.undistortion_enabled
-    
-    def cleanup(self):
-        """Cleanup display resources."""
-        cv2.destroyAllWindows()
-
-
 def main():
     """Main application entry point."""
     print("Aria Direct Display - Real-time camera stream visualization (Threaded)")
-    print("Controls: 'q'=quit, 's'=save images, 'u'=toggle undistortion, ESC=quit")
+    if ENABLE_DISPLAY:
+        print("Controls: 'q'=quit, 's'=save images, 'u'=toggle undistortion, ESC=quit")
+    else:
+        print("Running in headless mode (no display). Press Ctrl+C to quit.")
     
     setup_aria_sdk()
     
     # Initialize managers
     device_manager = AriaUSBDeviceManager(STREAMING_PROFILE, ENABLE_RGB_STREAM)
-    display_manager = AriaDisplayManager()
+    display_manager = AriaDisplayManager(
+        display_scale=DISPLAY_SCALE,
+        save_base_dir=SAVE_BASE_DIR,
+        rotation_k=ROTATION_K,
+        enable_rgb_stream=ENABLE_RGB_STREAM,
+        enable_undistortion=ENABLE_UNDISTORTION
+    )
     calibration_manager = None
     streaming_thread = None
     
@@ -394,21 +238,27 @@ def main():
             except Empty:
                 pass  # No more frames in queue
             
-            # Display frames (keeps existing processing pipeline)
-            display_manager.display_frames(current_frames)
-            
-            # Handle keyboard input
-            key = cv2.waitKey(10) & 0xFF
-            if key == ord('q') or key == 27:  # 'q' or ESC
-                break
-            elif key == ord('s'):
-                display_manager.save_current_frames(current_frames)
-            elif key == ord('u'):
-                # Toggle undistortion
-                enabled = display_manager.toggle_undistortion()
-                calibration_manager.use_undistorted = enabled
-                print(f"Undistortion {'enabled' if enabled else 'disabled'}")
-            
+            # Display frames only if display is enabled
+            if ENABLE_DISPLAY:
+                display_manager.display_frames(current_frames)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(10) & 0xFF
+                if key == ord('q') or key == 27:  # 'q' or ESC
+                    break
+                elif key == ord('s'):
+                    display_manager.save_current_frames(current_frames)
+                elif key == ord('u'):
+                    # Toggle undistortion
+                    enabled = display_manager.toggle_undistortion()
+                    calibration_manager.use_undistorted = enabled
+                    print(f"Undistortion {'enabled' if enabled else 'disabled'}")
+            else:
+                # In headless mode, just sleep to prevent busy waiting
+                time.sleep(0.1)
+                # You can still save frames programmatically in headless mode
+                # display_manager.save_current_frames(current_frames)
+    
     except KeyboardInterrupt:
         print("\nUser interrupted (Ctrl+C)")
     except Exception as e:

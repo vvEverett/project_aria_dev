@@ -264,9 +264,9 @@ def check_glib() -> bool:
     ldd_major = int(m.group(1))
     ldd_minor = int(m.group(2))
 
-    if ldd_major != 2 or ldd_minor < 34:
+    if ldd_major != 2 or ldd_minor < 31: # original version is 2.34, but we modified it to 2.31 to allow for compatibility with older systems
         failure(
-            f"Your system glibc ({ldd_major}.{ldd_minor}) is too old, at least v2.34 is required. Please use a more recent Linux distribution"
+            f"Your system glibc ({ldd_major}.{ldd_minor}) is too old, at least v2.31 is required. Please use a more recent Linux distribution"
         )
 
     success("glibc version ok")

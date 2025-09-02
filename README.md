@@ -12,7 +12,7 @@ A containerized development environment for Meta's Project Aria smart glasses, e
 
 1. **Run system diagnostics on HOST** (important first step):
    ```bash
-   python doctor.py
+   sudo python doctor.py
    ```
    This validates your system configuration and hardware connectivity.
 
@@ -42,15 +42,16 @@ A containerized development environment for Meta's Project Aria smart glasses, e
 
 ## Features
 
-- **Real-time Streaming**: UDP and ZeroMQ transport for stereo camera data
 - **Computer Vision**: Camera calibration, undistortion, and image processing
-- **ROS Integration**: ROS1 nodes for robotics applications
+- **ROS2 Integration**: Modern ROS2 nodes for robotics applications
+- **Direct Display**: Native USB connection with OpenCV display
 - **Containerized Development**: Reproducible environment with hardware access
 - **Comprehensive Testing**: Built-in diagnostics and validation tools
 
 ## Core Components
 
-- **Streaming System**: Multiple transport protocols (UDP, ZeroMQ)
+- **ROS2 Integration**: Modern ROS2 publisher/subscriber nodes
+- **Direct Display**: USB-based real-time camera display
 - **Calibration Management**: Camera calibration and undistortion pipeline
 - **Device Management**: Aria device connection and session handling
 - **Analysis Tools**: Timestamp synchronization and performance monitoring
@@ -58,35 +59,63 @@ A containerized development environment for Meta's Project Aria smart glasses, e
 ## Development Workflow
 
 ### Architecture Overview
-- **Sender**: Runs inside Docker container (connects to Aria device)
-- **Receiver**: Runs on HOST system (receives streamed data)
+- **Direct_Display**: Runs inside Docker container (connects to Aria device)
+- **Sender(Publisher)**: Runs inside Docker container (connects to Aria device)
+- **Receiver(Subscriber)**: Runs on HOST system or other docker container(receives streamed data)
 
 ### Start Streaming (Inside Container)
+
+#### Current Methods
 ```bash
 # Enter container
 docker exec -it aria-development bash
 
-# Start UDP streaming
-python udp_sender.py
+# Direct display with real-time viewing
+python aria_direct_display.py
 
-# Start ZeroMQ streaming
-python zmq_sender_usb.py
+# ROS2 publisher (with display)
+python aria_ros2_publisher.py
+```
+
+#### Legacy Methods (Still Available)
+```bash
+# Legacy UDP streaming
+python legacy/udp_sender.py
+
+# Legacy ZeroMQ streaming
+python legacy/zmq_sender_usb.py
 ```
 
 ### Receive Data (On HOST)
-```bash
-# UDP receiver (on host)
-python aria_workspace/udp_receiver.py
 
-# ZeroMQ receiver (on host)
-python aria_workspace/zmq_receiver.py
+#### Current Methods
+```bash
+# ROS2 subscriber (all cameras in one window)
+python aria_workspace/aria_ros2_subscriber.py
+```
+
+#### Legacy Methods (Still Available)
+```bash
+# Legacy UDP receiver
+python aria_workspace/legacy/udp_receiver.py
+
+# Legacy ZeroMQ receiver
+python aria_workspace/legacy/zmq_receiver.py
 ```
 
 ### ROS Integration (On HOST)
+
+#### ROS2 (Current)
 ```bash
-# Start ROS nodes (on host)
-python aria_workspace/udp_receiver_node.py
-python aria_workspace/zmq_receiver_node.py
+# ROS2 subscriber node
+python aria_workspace/aria_ros2_subscriber.py
+```
+
+#### ROS1 Legacy (Still Available)
+```bash
+# Legacy ROS1 nodes
+python aria_workspace/legacy/udp_receiver_node.py
+python aria_workspace/legacy/zmq_receiver_node.py
 ```
 
 ### Testing and Analysis (Inside Container)
@@ -100,6 +129,28 @@ python aria_calibration_extractor.py
 # Analyze stream timing
 python aria_stream_timestamp_sync_analyzer.py
 ```
+
+## New Features (ROS2 & Direct Display)
+
+### Direct Display Mode
+- **aria_direct_display.py**: Direct USB connection with real-time OpenCV display
+- **Features**: SLAM cameras (left/right) + RGB, undistortion toggle, frame saving
+- **Controls**: 'q' quit, 's' save frames, 'u' toggle undistortion, ESC quit
+
+### ROS2 Integration
+- **aria_ros2_publisher.py**: Publishes all camera feeds to ROS2 topics
+- **aria_ros2_subscriber.py**: Subscribes and displays all feeds in single window
+- **Topics**: 
+  - `/aria/slam_left/raw` and `/aria/slam_left/undistorted`
+  - `/aria/slam_right/raw` and `/aria/slam_right/undistorted`  
+  - `/aria/rgb/raw` and `/aria/rgb/undistorted`
+- **Transport**: High-performance shared memory (SHM)
+
+### Legacy Functions (Still Available)
+Legacy streaming functions have been moved to `aria_workspace/legacy/` but remain fully functional:
+- UDP streaming: `udp_sender.py`, `udp_receiver.py`, `udp_receiver_node.py`
+- ZeroMQ streaming: `zmq_sender*.py`, `zmq_receiver*.py`, `zmq_receiver_node.py`
+- Legacy utilities: `aria_utils.py`, `common.py`
 
 ## Configuration
 
@@ -130,9 +181,9 @@ python aria_stream_timestamp_sync_analyzer.py
    - Configurable output parameters
 
 3. **Streaming System**:
-   - **UDP Transport**: Basic streaming with JPEG compression
-   - **ZeroMQ Transport**: High-performance IPC streaming
-   - **ROS Integration**: ROS1 nodes for robotics applications
+   - **Direct Display**: Real-time USB connection with OpenCV display
+   - **ROS2 Integration**: Modern ROS2 publisher/subscriber with SHM transport
+   - **Legacy Support**: UDP/ZeroMQ streaming and ROS1 nodes (in legacy/ folder)
 
 ### Data Flow Architecture
 
